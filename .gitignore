@@ -1,0 +1,8 @@
+*.o
+bench_data
+fastst-launch
+fastst
+fastst-hotkey
+fastst-hotkey-compat
+fastst-compat
+fastst-compat-lld
