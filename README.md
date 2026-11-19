@@ -9,7 +9,7 @@ Requires FASM 1.73, GCC, X11, Xft, Fontconfig, and libutil.
 On Arch Linux, build and install with:
 
 ```sh
-sudo pacman -S fasm gcc libx11 libxft libxrender libxrandr
+sudo pacman -S fasm gcc libx11 libxft libxrender libxrandr libxpresent
 make
 sudo make install
 ```

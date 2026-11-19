@@ -14,7 +14,7 @@ UNITDIR ?= $(if $(filter $(HOME)/.local,$(PREFIX)),$(HOME)/.local/share/systemd/
 
 # Keep the existing small, non-PIE Linux ELF link layout.
 TERM_LDFLAGS ?= -no-pie -Wl,-z,relro -Wl,-z,now -Wl,--build-id=none -Wl,-z,noseparate-code
-TERM_LIBS    ?= -lX11 -l:libXft.so.2 -l:libXrender.so.1 -l:libXrandr.so.2 -l:libfontconfig.so.1 -lutil -pthread
+TERM_LIBS    ?= -lX11 -l:libXft.so.2 -l:libXrender.so.1 -l:libXrandr.so.2 -l:libfontconfig.so.1 -lutil -ldl -pthread
 
 PROGRAMS = fasterm fasterm-launch fasterm-hotkey
 # FASM includes are source dependencies, not merely text substituted at build time.
@@ -104,6 +104,7 @@ check-services:
 check: $(PROGRAMS) check-services
 	python3 tests/check_fasm_widths.py fasterm.asm
 	python3 tests/check_xrandr_layout.py
+	python3 tests/check_present_fasm.py
 	python3 tests/check_fasm_widths.py fasterm-launch.asm
 	python3 tests/check_fasm_widths.py fasterm-hotkey.asm
 	xvfb-run -a python3 tests/regress_scrollback_input.py ./fasterm

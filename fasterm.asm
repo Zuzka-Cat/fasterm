@@ -11,6 +11,7 @@ include 'include/protocol.inc'
 include 'include/sysv64.inc'
 include 'include/x11.inc'
 include 'include/xrandr.inc'
+include 'include/present.inc'
 include 'include/cell.inc'
 public main
 extrn XOpenDisplay
@@ -21,11 +22,6 @@ extrn XDefaultColormap
 extrn XCreateSimpleWindow
 extrn XSelectInput
 extrn XMapWindow
-extrn XCreateGC
-extrn XSetGraphicsExposures
-extrn XSetForeground
-extrn XFillRectangle
-extrn XDrawLine
 extrn XStoreName
 extrn XInternAtom
 extrn XSetWMProtocols
@@ -38,8 +34,12 @@ extrn XSync
 extrn XftDrawPicture
 extrn XCreatePixmap
 extrn XFreePixmap
-extrn XCopyArea
 extrn XDefaultDepth
+extrn XGetEventData
+extrn XFreeEventData
+extrn dlopen
+extrn dlsym
+extrn dlclose
 extrn XRenderFillRectangles
 extrn XRRQueryExtension
 extrn XRRQueryVersion
@@ -315,21 +315,10 @@ main:
   mov rsi,[win]
   mov edx,KeyPressMask+ButtonPressMask+ButtonReleaseMask+PointerMotionMask+ExposureMask+StructureNotifyMask
   ccall XSelectInput
-  mov rdi,[dpy]
-  mov rsi,[win]
-  xor edx,edx
-  xor ecx,ecx
-  ccall XCreateGC
-  mov [gc],rax
-  ; XCopyArea would otherwise enqueue a NoExpose event on every frame.
-  mov rdi,[dpy]
-  mov rsi,[gc]
-  xor edx,edx
-  ccall XSetGraphicsExposures
-
-  ; Paint into a server-side pixmap, not the visible window. The entire
-  ; completed frame is copied to the window once, so rapid fullscreen output
-  ; cannot expose the gap between background clearing and lower-row glyphs.
+  ; Present is optional and dynamically loaded: no C implementation and
+  ; no hard dependency on a new shared library. Without Present, draw
+  ; directly to the window rather than doing unsynchronized XCopyArea.
+  call present_probe
   call recreate_draw_target
 
   ; WM_DELETE_WINDOW protocol
@@ -479,9 +468,41 @@ main:
   mov [frame_interval_ns],rax
   mov qword [next_frame_ns],0     ; rate/monitor changed: no stale deadline
 .refresh_done:
+  ; Enable synchronized presentation only when XRandR reports a physical
+  ; scanout clock. A virtual X server may advertise Present but never tick.
+  cmp byte [present_available],0
+  je .present_ready
+  cmp byte [present_active],0
+  jne .present_ready
+  cmp qword [frame_interval_ns],0
+  je .present_ready
+  mov byte [present_active],1
+  call recreate_draw_target
+  cmp byte [present_active],0    ; pixmap allocation can fail
+  je .present_ready
+  call invalidate_all
+.present_ready:
   call check_cursor
   cmp byte [dirty_any],0
   je .no_draw
+  ; One pending XPresent at most. Parsing PTY output continues but only the
+  ; latest state gets drawn after the server releases the previous pixmap.
+  cmp byte [present_active],0
+  je .software_pace
+  cmp byte [present_busy],0
+  je .draw_now
+  call frame_clock
+  sub rax,[present_started_ns]
+  cmp rax,500000000             ; lost/unsupported IdleNotify: recover
+  jae .present_stalled
+  mov qword [frame_wait],0
+  mov qword [frame_wait+8],50000000 ; check stalled request every 50ms
+  lea rdx,[frame_wait]
+  jmp .wait
+.present_stalled:
+  call present_disable
+  jmp .event_loop
+.software_pace:
   cmp qword [frame_interval_ns],0
   je .draw_now                   ; no XRandR clock: never assume 60 Hz
   call frame_clock
@@ -567,14 +588,12 @@ frame_clock:
 
 ; The XRandR library ABI and helpers are pure FASM.
 include 'include/randr_impl.inc'
+include 'include/present_impl.inc'
 
-; Recreate the Xft destination for the current window size. All drawing
-; (including XRender fills, Unicode clips and Xft text) targets the pixmap.
-; No C helper, CPU-side framebuffer or second X11 connection is needed.
-; On allocation failure, fall back to the original direct window renderer.
+; Recreate the Xft destination. Under Present, all Xft drawing targets
+; the retained pixmap. Otherwise draw directly into the window, avoiding the
+; tearing introduced by the earlier unsynchronized XCopyArea presentation.
 recreate_draw_target:
-  ; A newly allocated pixmap has undefined contents, including its margins.
-  mov byte [backbuffer_needs_full_copy],1
   cmp qword [draw],0
   je .free_pixmap
   mov rdi,[draw]
@@ -588,6 +607,8 @@ recreate_draw_target:
   ccall XFreePixmap
   mov qword [back_pixmap],0
 .create:
+  cmp byte [present_active],0
+  je .fallback
   mov rdi,[dpy]
   mov esi,[screen]
   ccall XDefaultDepth
@@ -598,7 +619,7 @@ recreate_draw_target:
   mov ecx,[height]
   ccall XCreatePixmap
   test rax,rax
-  jz .fallback
+  jz .allocation_failed
   mov [back_pixmap],rax
   mov rdi,[dpy]
   mov rsi,rax
@@ -611,7 +632,10 @@ recreate_draw_target:
   mov rsi,[back_pixmap]
   ccall XFreePixmap
   mov qword [back_pixmap],0
+.allocation_failed:
+  mov byte [present_available],0  ; do not retry every event loop pass
 .fallback:
+  mov byte [present_active],0
   mov rdi,[dpy]
   mov rsi,[win]
   mov rdx,[visual]
@@ -1264,10 +1288,19 @@ clear_row:
   ret
 
 invalidate_all:
+  ; Any expose, resize, or scrolling change must present the full window
+  ; once, including margins. Partial Present region is for later frames.
+  mov byte [paint_full_frame],1
   mov byte [dirty_any],1
   lea rdi,[dirty]
   mov ecx,MAXROW
   mov al,1
+  rep stosb
+  ; The last painted snapshots are only valid while the pixmap content is
+  ; retained. Full invalidate (including scroll, resize, expose) must redraw.
+  lea rdi,[paint_valid]
+  mov ecx,MAXROW
+  xor eax,eax
   rep stosb
   ret
 
@@ -1864,8 +1897,8 @@ feed_bytes:
 .loop:
   cmp r12,r13
   jae .end
-  ; SSE4.1 batch: four printable ASCII characters, normal parser state,
-  ; width available and no pending wrap. No libc call in fast path.
+  ; SSE4.1 batch: eight printable ASCII cells at once, then existing
+  ; four-cell fallback, without touching UTF-8/CSI/insert/wrap paths.
   cmp dword [parse_state],0
   jne .slow
   cmp dword [utf_need],0
@@ -1877,6 +1910,60 @@ feed_bytes:
   jne .slow
   cmp byte [wrap_next],0
   jne .slow
+  lea rax,[r12+8]
+  cmp rax,r13
+  ja .simd4
+  mov eax,[cols]
+  sub eax,[cursor_x]
+  cmp eax,8
+  jl .simd4
+  mov rax,[r12]
+  mov r10,8080808080808080h
+  test rax,r10
+  jnz .simd4
+  mov rdx,rax
+  mov r8,2020202020202020h
+  sub rdx,r8
+  test rdx,r10
+  jnz .simd4
+  mov rdx,rax
+  mov r8,0101010101010101h
+  add rdx,r8
+  test rdx,r10
+  jnz .simd4
+  movq xmm3,rax
+  movdqa xmm4,xmm3
+  psrldq xmm4,4
+  pmovzxbd xmm0,xmm3
+  pmovzxbd xmm4,xmm4
+  movd xmm1,[curattr]
+  pshufd xmm1,xmm1,0
+  movdqa xmm2,xmm0
+  punpckldq xmm0,xmm1
+  punpckhdq xmm2,xmm1
+  movdqa xmm5,xmm4
+  punpckldq xmm4,xmm1
+  punpckhdq xmm5,xmm1
+  mov eax,[cursor_y]
+  call rowaddr
+  mov edx,[cursor_x]
+  lea rax,[rax+rdx*CELL_BYTES]
+  movdqu [rax],xmm0
+  movdqu [rax+16],xmm2
+  movdqu [rax+32],xmm4
+  movdqu [rax+48],xmm5
+  add dword [cursor_x],8
+  mov eax,[cursor_x]
+  cmp eax,[cols]
+  jne .simd8_no_wrap
+  dec dword [cursor_x]
+  mov byte [wrap_next],1
+.simd8_no_wrap:
+  mov eax,[cursor_y]
+  call mark_row
+  add r12,8
+  jmp .loop
+.simd4:
   lea rax,[r12+4]
   cmp rax,r13
   ja .slow
@@ -3444,41 +3531,143 @@ draw_graphics:
   xor eax,eax
   ret
 
-; Render only dirty visible rows. Puts background rectangles first,
-; then groups foreground glyphs into same-color runs.
+; Render dirty rows. XPresent's offscreen path batches default background
+; fills. Direct fallback clears and redraws each row in sequence so that
+; lower rows are not left unpainted while upper rows are being drawn.
 render:
   push rbx
   push r12
   push r13
   push r14
   push r15
-  ; All dirty rows receive the same default background. Collect adjacent
-  ; rows into bands, and submit those bands as *one* XRender request rather
-  ; than one XftDrawRect call per dirty row.
+  ; A dirty row is only a *candidate*. Compare against the retained
+  ; pixmap's last painted cell image, and determine the smallest paint span.
+  ; The one-cell halo allows italic/overhanging glyphs to be repainted.
+  ; A changed cursor row is forced separately below.
+  mov dword [paint_rows],0
+  xor r13d,r13d
+.prepare:
+  cmp r13d,[rows]
+  jge .prepared
+  cmp byte [dirty+r13],0
+  je .prepare_next
+  mov dword [paint_x0+r13*4],0
+  mov eax,[cols]
+  mov [paint_x1+r13*4],eax
+  cmp byte [dirty+r13],2
+  je .commit_snapshot
+  cmp byte [paint_valid+r13],0
+  je .commit_snapshot
+  mov eax,r13d
+  call visaddr
+  mov r14,rax
+  lea r15,[paint_snapshot]
+  mov eax,r13d
+  shl rax,RBITS
+  add r15,rax
+  xor ecx,ecx
+  ; SSE4.1 PTEST compares two packed 8-byte cells per iteration.
+  ; Unaligned loads also handle odd terminal widths safely.
+.first_difference:
+  mov eax,[cols]
+  sub eax,ecx
+  cmp eax,2
+  jb .first_scalar
+  movdqu xmm0,[r14+rcx*CELL_BYTES]
+  movdqu xmm1,[r15+rcx*CELL_BYTES]
+  pxor xmm0,xmm1
+  ptest xmm0,xmm0
+  jnz .first_pair_changed
+  add ecx,2
+  jmp .first_difference
+.first_pair_changed:
+  mov rax,[r14+rcx*CELL_BYTES]
+  cmp rax,[r15+rcx*CELL_BYTES]
+  jne .found_first
+  inc ecx
+  jmp .found_first
+.first_scalar:
+  cmp ecx,[cols]
+  jae .unchanged_row
+  mov rax,[r14+rcx*CELL_BYTES]
+  cmp rax,[r15+rcx*CELL_BYTES]
+  jne .found_first
+  jmp .unchanged_row
+.found_first:
+  mov [paint_x0+r13*4],ecx
+  mov edx,[cols]
+.last_difference:
+  cmp edx,2
+  jb .last_scalar
+  lea eax,[edx-2]
+  movdqu xmm0,[r14+rax*CELL_BYTES]
+  movdqu xmm1,[r15+rax*CELL_BYTES]
+  pxor xmm0,xmm1
+  ptest xmm0,xmm0
+  jnz .last_pair_changed
+  sub edx,2
+  jmp .last_difference
+.last_pair_changed:
+  dec edx
+  mov rax,[r14+rdx*CELL_BYTES]
+  cmp rax,[r15+rdx*CELL_BYTES]
+  jne .found_last
+  ; Right cell matched; the left cell at edx-1 is changed.
+  dec edx
+  jmp .found_last
+.last_scalar:
+  dec edx
+  mov rax,[r14+rdx*CELL_BYTES]
+  cmp rax,[r15+rdx*CELL_BYTES]
+  je .last_difference
+.found_last:
+  inc edx
+  mov [paint_x1+r13*4],edx
+  ; One cell of halo on each side keeps overhanging font ink correct.
+  test ecx,ecx
+  jz .halo_right
+  dec ecx
+  mov [paint_x0+r13*4],ecx
+.halo_right:
+  cmp edx,[cols]
+  jge .commit_snapshot
+  inc edx
+  mov [paint_x1+r13*4],edx
+.commit_snapshot:
+  mov eax,r13d
+  call visaddr
+  mov rsi,rax
+  lea rdi,[paint_snapshot]
+  mov eax,r13d
+  shl rax,RBITS
+  add rdi,rax
+  mov ecx,[cols]
+  rep movsq
+  mov byte [paint_valid+r13],1
+  inc dword [paint_rows]
+  jmp .prepare_next
+.unchanged_row:
+  mov byte [dirty+r13],0
+.prepare_next:
+  inc r13d
+  jmp .prepare
+.prepared:
+  cmp dword [paint_rows],0
+  jne .paint_required
+  mov byte [dirty_any],0
+  jmp .return
+.paint_required:
+  ; Batch fills to XRender; preserving unchanged cells also preserves
+  ; the rest of the retained pixmap, greatly reducing GPU/Xft work.
   mov dword [bg_rect_count],0
-  mov dword [copy_min_y],7fffffffh
-  mov dword [copy_max_y],0
+  cmp byte [present_active],0
+  je .bg_done                   ; direct fallback uses per-row clearing
   xor r12d,r12d
 .bg_collect:
   cmp r12d,[rows]
   jge .bg_submit
   cmp byte [dirty+r12],0
   je .bg_collect_next
-  ; Track the vertical damage range while scanning dirty rows. One copy
-  ; of this band is cheaper than copying the entire fullscreen window when
-  ; only a few rows change. Borders are covered because the copy is full width.
-  mov eax,r12d
-  imul eax,[cell_h]
-  add eax,PAD
-  cmp eax,[copy_min_y]
-  jae .copy_min_ok
-  mov [copy_min_y],eax
-.copy_min_ok:
-  add eax,[cell_h]
-  cmp eax,[copy_max_y]
-  jbe .copy_max_ok
-  mov [copy_max_y],eax
-.copy_max_ok:
   mov edx,[bg_rect_count]
   test edx,edx
   jz .bg_new
@@ -3488,6 +3677,16 @@ render:
   jne .bg_new
   dec edx
   lea rbx,[bg_rects+rdx*8]
+  mov eax,[paint_x0+r12*4]
+  imul eax,[cell_w]
+  add eax,PAD
+  cmp word [rbx+XRectangle.x],ax
+  jne .bg_band_overflow
+  mov eax,[paint_x1+r12*4]
+  sub eax,[paint_x0+r12*4]
+  imul eax,[cell_w]
+  cmp word [rbx+XRectangle.width],ax
+  jne .bg_band_overflow
   movzx ecx,word [rbx+XRectangle.height]
   add ecx,[cell_h]
   cmp ecx,65535                 ; XRectangle height is only 16 bits
@@ -3498,16 +3697,17 @@ render:
   inc edx                      ; start another band, keep the old one
 .bg_new:
   lea rbx,[bg_rects+rdx*8]
-  mov word [rbx+XRectangle.x],PAD
+  mov eax,[paint_x0+r12*4]
+  imul eax,[cell_w]
+  add eax,PAD
+  mov [rbx+XRectangle.x],ax
   mov eax,r12d
   imul eax,[cell_h]
   add eax,PAD
   mov [rbx+XRectangle.y],ax
-  mov eax,[width]
-  sub eax,PAD*2
-  jg .bg_width_ok
-  mov eax,1
-.bg_width_ok:
+  mov eax,[paint_x1+r12*4]
+  sub eax,[paint_x0+r12*4]
+  imul eax,[cell_w]
   mov [rbx+XRectangle.width],ax
   mov eax,[cell_h]
   mov [rbx+XRectangle.height],ax
@@ -3548,11 +3748,28 @@ render:
   imul eax,[cell_h]
   add eax,PAD
   mov [paint_y],eax
-  ; Default backgrounds are already submitted together above.
-  ; background runs: only nondefault background
-  xor r12d,r12d
+  ; Direct-window fallback must clear and redraw the SAME row together;
+  ; bulk-clearing all rows first caused the original bottom-row dimming.
+  cmp byte [present_active],0
+  jne .bg_loop_start
+  xor edi,edi
+  call ensure_color
+  mov rsi,rax
+  mov rdi,[draw]
+  mov edx,[paint_x0+r13*4]
+  imul edx,[cell_w]
+  add edx,PAD
+  mov ecx,[paint_y]
+  mov r8d,[paint_x1+r13*4]
+  sub r8d,[paint_x0+r13*4]
+  imul r8d,[cell_w]
+  mov r9d,[cell_h]
+  ccall XftDrawRect
+.bg_loop_start:
+  ; Background runs only in the changed span.
+  mov r12d,[paint_x0+r13*4]
 .bg_loop:
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .fg_start
   mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
@@ -3562,7 +3779,7 @@ render:
   mov r15d,r12d
 .bg_find:
   inc r12d
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .bg_draw
   mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
@@ -3638,9 +3855,9 @@ render:
   mov r9d,[cell_h]
   ccall XftDrawRect
 .fg_no_selection:
-  xor r12d,r12d
+  mov r12d,[paint_x0+r13*4]
 .fg_loop:
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .underline_start
   test dword [r14+r12*CELL_BYTES+Cell.style],STYLE_WIDE_TRAIL  ; wide rune trailing cell
   jz .fg_not_dummy
@@ -3660,7 +3877,7 @@ render:
   lea r9,[glyphs]
   xor r10d,r10d              ; characters in this run
 .fg_find:
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .fg_draw
   test dword [r14+r12*CELL_BYTES+Cell.style],STYLE_WIDE_TRAIL
   jnz .fg_draw
@@ -3860,9 +4077,9 @@ render:
   jmp .fg_loop
 ; SGR underline, grouped in contiguous foreground-color runs.
 .underline_start:
-  xor r12d,r12d
+  mov r12d,[paint_x0+r13*4]
 .ul_loop:
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .row_next
   mov edi,[r14+r12*CELL_BYTES+Cell.style]
   test edi,STYLE_UNDERLINE
@@ -3872,7 +4089,7 @@ render:
   mov r15d,r12d
 .ul_find:
   inc r12d
-  cmp r12d,[cols]
+  cmp r12d,[paint_x1+r13*4]
   jge .ul_draw
   mov edi,[r14+r12*CELL_BYTES+Cell.style]
   test edi,STYLE_UNDERLINE
@@ -4014,47 +4231,67 @@ render:
   lea rsi,[border_rects]
   mov edx,[border_rect_count]
   call fill_rectangles
-  ; X11 processes each connection in order: background, glyphs, then one
-  ; server-side copy. No intermediate blank glyph rows reach the window.
-  ; Full copy only for new pixmaps / Expose, otherwise copy the damage band.
+  ; Present can copy just the spans repainted in this retained pixmap.
+  ; XFixesSetRegion is optional; without it the old full-size vblank-safe
+  ; Present request remains unchanged.
+  cmp byte [present_active],0
+  je .flush_direct
   cmp qword [back_pixmap],0
   je .flush_direct
-  mov r9d,[copy_min_y]
-  mov eax,[copy_max_y]
-  sub eax,r9d
-  cmp byte [backbuffer_needs_full_copy],0
-  je .copy_band
-  xor r9d,r9d
-  mov eax,[height]
-  mov byte [backbuffer_needs_full_copy],0
-.copy_band:
-  mov [copy_height],eax
-  mov [copy_y],r9d
-  mov rdi,[dpy]
-  mov rsi,[back_pixmap]
-  mov rdx,[win]
-  mov rcx,[gc]
-  xor r8d,r8d
-  mov [stack_save],rsp
-  and rsp,-16
-  sub rsp,32
+  cmp qword [present_update_region],0
+  je .present_now
+  cmp byte [paint_full_frame],0
+  je .present_partial
+  mov word [present_update_rects+XRectangle.x],0
+  mov word [present_update_rects+XRectangle.y],0
   mov eax,[width]
-  mov [rsp],rax
-  mov eax,[copy_height]
-  mov [rsp+8],rax
-  mov qword [rsp+16],0
-  mov eax,[copy_y]
-  mov [rsp+24],rax
-  call XCopyArea
-  mov rsp,[stack_save]
+  mov word [present_update_rects+XRectangle.width],ax
+  mov eax,[height]
+  mov word [present_update_rects+XRectangle.height],ax
+  mov ecx,1
+  jmp .update_region
+.present_partial:
+  lea rsi,[bg_rects]
+  lea rdi,[present_update_rects]
+  mov ecx,[bg_rect_count]
+  push rcx
+  rep movsq                          ; XRectangle is 8 bytes
+  lea rsi,[border_rects]
+  mov ecx,[border_rect_count]
+  push rcx
+  rep movsq                          ; include clipped Unicode margins
+  pop rax
+  pop rcx
+  add ecx,eax
+.update_region:
+  mov rdi,[dpy]
+  mov rsi,[present_update_region]
+  lea rdx,[present_update_rects]
+  ; ECX is the number of rectangles, all written before this request.
+  ccall qword [fixes_set_fn]
+.present_now:
+  call present_submit
 .flush_direct:
+  mov byte [paint_full_frame],0
   mov rdi,[dpy]
   ccall XFlush
+.return:
   pop r15
   pop r14
   pop r13
   pop r12
   pop rbx
+  ret
+
+; A moved cursor changes the overlay without changing cell bytes.
+force_row:
+  push rax
+  call mark_row
+  pop rax
+  cmp eax,[rows]
+  jae .done
+  mov byte [dirty+rax],2
+.done:
   ret
 
 ; Mark previous and current cursor rows when position changes.
@@ -4067,10 +4304,17 @@ check_cursor:
   jne .moved
   ret
 .moved:
+  ; Applications such as cmatrix hide the cursor while flooding updates.
+  ; Changing its logical position then requires no rendering at all.
+  cmp dword [cursor_show],0
+  je .save_position
+  cmp dword [view],0
+  jne .save_position
   mov eax,[old_cy]
-  call mark_row
+  call force_row
   mov eax,[cursor_y]
-  call mark_row
+  call force_row
+.save_position:
   mov eax,[cursor_x]
   mov [old_cx],eax
   mov eax,[cursor_y]
@@ -4089,6 +4333,18 @@ drain_x_events:
   lea rsi,[event]
   ccall XNextEvent
   mov eax,dword [event]
+  cmp eax,GenericEvent
+  jne .not_present_generic
+  cmp byte [present_available],0
+  je .loop
+  mov edx,dword [event+XGenericCookie.extension]
+  cmp edx,[present_opcode]
+  jne .loop
+  cmp dword [event+XGenericCookie.evtype],PresentIdleNotify
+  jne .loop
+  call present_receive_idle
+  jmp .loop
+.not_present_generic:
   mov edx,[randr_event_base]
   test edx,edx
   js .dispatch
@@ -4124,8 +4380,7 @@ drain_x_events:
   call handle_key
   jmp .loop
 .expose:
-  ; Exposed margins also need restoring, not only the cell damage band.
-  mov byte [backbuffer_needs_full_copy],1
+  ; A full repaint restores the entire frame after an expose.
   call invalidate_all
   jmp .loop
 .config:
@@ -4170,7 +4425,7 @@ handle_resize:
   mov [width],eax
   mov eax,dword [event+XConfigure.height]
   mov [height],eax
-  ; A pixmap must match the window: XCopyArea cannot read pixels outside it.
+  ; The XPresent pixmap must match the window dimensions.
   call recreate_draw_target
   mov eax,[width]
   cmp eax,PAD*2
@@ -5096,6 +5351,14 @@ section '.data' writeable
   utf8_name db 'UTF8_STRING',0
   paste_name db 'FASTERM_PASTE',0
   targets_name db 'TARGETS',0
+  present_library db 'libXpresent.so.1',0
+  present_query_symbol db 'XPresentQueryExtension',0
+  present_select_symbol db 'XPresentSelectInput',0
+  present_pixmap_symbol db 'XPresentPixmap',0
+  fixes_library db 'libXfixes.so.3',0
+  fixes_query_symbol db 'XFixesQueryExtension',0
+  fixes_create_symbol db 'XFixesCreateRegion',0
+  fixes_set_symbol db 'XFixesSetRegion',0
   term_name db 'TERM',0
   term_value db 'xterm-256color',0
   color_name db 'COLORTERM',0
@@ -5209,6 +5472,7 @@ section '.bss' writeable align 4096
   align 8
   bg_rects rb MAXROW*XRECTANGLE_BYTES
   border_rects rb 4*XRECTANGLE_BYTES
+  present_update_rects rb (MAXROW+4)*XRECTANGLE_BYTES
   fallback_fonts rq 16
   fallback_next rd 1
   fallback_pattern rb 96
@@ -5218,12 +5482,26 @@ section '.bss' writeable align 4096
   draw rq 1
   draw_picture rq 1
   back_pixmap rq 1
-  copy_min_y rd 1
-  copy_max_y rd 1
-  copy_y rd 1
-  copy_height rd 1
-  backbuffer_needs_full_copy rb 1
-  gc rq 1
+  present_handle rq 1
+  present_query_fn rq 1
+  present_select_fn rq 1
+  present_pixmap_fn rq 1
+  fixes_handle rq 1
+  fixes_create_fn rq 1
+  fixes_query_fn rq 1
+  fixes_set_fn rq 1
+  fixes_event_base rd 1
+  fixes_error_base rd 1
+  present_update_region rq 1
+  present_eid rq 1
+  present_started_ns rq 1
+  present_opcode rd 1
+  present_event_base rd 1
+  present_error_base rd 1
+  present_serial rd 1
+  present_available rb 1
+  present_active rb 1
+  present_busy rb 1
   clipboard rq 1
   utf8_atom rq 1
   paste_atom rq 1
@@ -5381,6 +5659,14 @@ section '.bss' writeable align 4096
   align 16
   colormap_xft rb PALETTE_CAP*XFTCOLOR_BYTES
   dirty rb MAXROW
+  paint_valid rb MAXROW
+  paint_full_frame rb 1
+  align 16
+  paint_x0 rd MAXROW
+  paint_x1 rd MAXROW
+  paint_rows rd 1
+  align 16
+  paint_snapshot rb MAXROW*ROWB
   glyphs rd MAXCOL
   osc_buffer rb 512
   reply_buf rb 64
