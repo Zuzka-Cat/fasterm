@@ -23,7 +23,7 @@ Add this to `~/.config/i3/config`:
 exec_always --no-startup-id sh -c 'systemctl --user import-environment DISPLAY XAUTHORITY && systemctl --user restart fasterm-server.service fasterm-hotkey.service'
 ```
 
-if you do not want to use fasterm-hotkey, you can use this below but it'll be slower:
+if you do not want to use fasterm-hotkey, you can use this below but it'll be slower to launch:
 
 ```i3
 bindsym $mod+Return exec --no-startup-id /usr/local/bin/fasterm-launch
@@ -57,16 +57,6 @@ make update
 Run make as your normal user, not with `sudo`. `make update` handles installation privileges itself.
 Restarting the server does not close existing terminal windows. New windows use the updated binary.
 Avoid `pkill fasterm`, which can close active terminal windows. Use `fasterm --stop-server` to stop a manually running server.
-
-## Implementation
-
-Written for FASM 1.73 using ELF64 and the System V AMD64 ABI.
-Shared assembly definitions live in `include/`:
-
-- `protocol.inc` — launcher and server protocol
-- `sysv64.inc` — calling convention and Linux structures
-- `x11.inc` — X11, Xft, XRender, and KeySyms
-- `cell.inc` — eight-byte screen cell layout
 
 ### Rendering
 
