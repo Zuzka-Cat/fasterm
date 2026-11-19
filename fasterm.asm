@@ -45,6 +45,7 @@ extrn recv
 extrn pipe2
 extrn fork
 extrn signal
+extrn kill
 extrn getuid
 extrn geteuid
 extrn snprintf
@@ -167,6 +168,16 @@ main:
   cmp edi,2
   jl .normal_start
   mov rdi,[rsi+8]
+  lea rsi,[opt_stop_server]
+  ccall strcmp
+  test eax,eax
+  jnz .not_stop_server
+  call preload_stop_server
+  leave
+  ret
+.not_stop_server:
+  mov rax,[cmd_argv]
+  mov rdi,[rax+8]
   lea rsi,[opt_server]
   ccall strcmp
   test eax,eax
@@ -558,6 +569,57 @@ preload_open_socket:
   mov esi,SOCK_SEQPACKET_CLOEXEC
   xor edx,edx
   ccall socket
+  ret
+
+; Stop ONLY the listening server process, never any child X11 terminals.
+; SO_PEERCRED on a connection to a listening AF_UNIX socket returns the
+; credentials at listen() time: the supervisor PID, not the worker which
+; happens to accept this connection. This also stops servers from older
+; fasterm builds without needing a new protocol or a pidfile.
+preload_stop_server:
+  call preload_socket_addr
+  call preload_open_socket
+  test eax,eax
+  js .fail
+  mov [server_sock],eax
+  mov edi,eax
+  lea rsi,[server_addr]
+  mov edx,110
+  ccall connect
+  test eax,eax
+  js .close_fail
+  mov dword [server_credlen],12
+  mov edi,[server_sock]
+  mov esi,SOL_SOCKET
+  mov edx,SO_PEERCRED
+  lea rcx,[server_creds]
+  lea r8,[server_credlen]
+  ccall getsockopt
+  test eax,eax
+  jnz .close_fail
+  cmp dword [server_credlen],12
+  jne .close_fail
+  mov eax,dword [server_creds+4]
+  cmp eax,[server_uid]
+  jne .close_fail
+  mov edi,dword [server_creds] ; listening server's PID
+  test edi,edi
+  jle .close_fail
+  mov esi,SIGTERM
+  ccall kill
+  test eax,eax
+  jne .close_fail
+  mov dword [server_stop_status],0
+  jmp .close
+.close_fail:
+  mov dword [server_stop_status],1
+.close:
+  mov edi,[server_sock]
+  ccall close
+  mov eax,[server_stop_status]
+  ret
+.fail:
+  mov eax,1
   ret
 
 preload_client:
@@ -2168,6 +2230,10 @@ csi_sgr:
   je .bold
   cmp eax,22
   je .normal
+  cmp eax,3
+  je .italic
+  cmp eax,23
+  je .no_italic
   cmp eax,4
   je .underline
   cmp eax,24
@@ -2207,6 +2273,12 @@ csi_sgr:
   jmp .advance
 .bold:
   or dword [curattr],1000000h
+  jmp .advance
+.italic:
+  or dword [curattr],10000000h
+  jmp .advance
+.no_italic:
+  and dword [curattr],0efffffffh
   jmp .advance
 .underline:
   or dword [curattr],4000000h
@@ -2803,6 +2875,387 @@ cell_colors:
 .done:
   ret
 
+; Pick an Xft face for the SGR bold/italic attributes. Lazy loading keeps the
+; preconnected terminal startup path as light as the original regular face.
+; Input EDI=cell style, returns RAX=XftFont*; preserve RBX.
+select_font:
+  mov eax,edi
+  and eax,11000000h
+  jz .regular
+  push rbx
+  cmp eax,1000000h
+  je .bold
+  cmp eax,10000000h
+  je .italic
+  lea rbx,[font_bolditalic]
+  lea rdx,[font_bolditalic_spec]
+  jmp .choose
+.bold:
+  lea rbx,[font_bold]
+  lea rdx,[font_bold_spec]
+  jmp .choose
+.italic:
+  lea rbx,[font_italic]
+  lea rdx,[font_italic_spec]
+.choose:
+  mov rax,[rbx]
+  test rax,rax
+  jnz .done
+  mov rdi,[dpy]
+  mov esi,[screen]
+  ccall XftFontOpenName
+  test rax,rax
+  jnz .store
+  mov rax,[font]
+.store:
+  mov [rbx],rax
+.done:
+  pop rbx
+  ret
+.regular:
+  mov rax,[font]
+  ret
+
+; Draw a filled cell rectangle using eighth-cell coordinates (0..8).
+; EDI=x0, ESI=y0, EDX=x1, ECX=y1; each maps to an exact integer pixel
+; boundary. Adjacent fractions tile with no antialiasing or 1px seams.
+gfx_fraction_rect:
+  mov r10d,[cell_w]
+  imul edi,r10d
+  shr edi,3
+  imul edx,r10d
+  shr edx,3
+  sub edx,edi
+  mov r8d,edx
+  mov r10d,[cell_h]
+  imul esi,r10d
+  shr esi,3
+  imul ecx,r10d
+  shr ecx,3
+  sub ecx,esi
+  mov r9d,ecx
+  mov edx,edi
+  add edx,[gfx_x]
+  mov ecx,esi
+  add ecx,[paint_y]
+  mov rdi,[draw]
+  mov rsi,[gfx_color]
+  ccall XftDrawRect
+  ret
+
+; EDX=x0 pixels, ECX=y0 pixels, R8D=width, R9D=height.
+gfx_pixel_rect:
+  add edx,[gfx_x]
+  add ecx,[paint_y]
+  mov rdi,[draw]
+  mov rsi,[gfx_color]
+  ccall XftDrawRect
+  ret
+
+; EDI=codepoint, EBX=effective foreground, R12=column.
+; Returns EAX=1 if drawn, EAX=0 if it should go through Xft.
+; Render geometric Unicode blocks and box-drawing as exact cell-aligned
+; primitives instead of relying on font ink, which may have side bearings
+; or a shortened ascent/descent. This fixes image half-block seams as well.
+draw_graphics:
+  cmp edi,2500h
+  jb .unhandled
+  cmp edi,256dh
+  jb .box_range
+  cmp edi,2570h
+  jbe .rounded_box
+.box_range:
+  cmp edi,257fh
+  jbe .box
+  cmp edi,2580h
+  je .upper_half
+  cmp edi,2581h
+  jb .unhandled
+  cmp edi,2587h
+  jbe .lower_eighths
+  cmp edi,2588h
+  je .full
+  cmp edi,258fh
+  jbe .left_eighths
+  cmp edi,2590h
+  je .right_half
+  cmp edi,2594h
+  je .upper_eighth
+  cmp edi,2595h
+  je .right_eighth
+  cmp edi,2596h
+  jb .unhandled           ; U+2591..2593 are true shaded glyphs
+  cmp edi,259fh
+  ja .unhandled
+  sub edi,2596h
+  lea rax,[gfx_quadrants]
+  movzx r15d,byte [rax+rdi]
+  call .prepare
+  test r15b,4              ; top-left
+  jz .q_tr
+  xor edi,edi
+  xor esi,esi
+  mov edx,4
+  mov ecx,4
+  call gfx_fraction_rect
+.q_tr:
+  test r15b,8              ; top-right
+  jz .q_bl
+  mov edi,4
+  xor esi,esi
+  mov edx,8
+  mov ecx,4
+  call gfx_fraction_rect
+.q_bl:
+  test r15b,1              ; bottom-left
+  jz .q_br
+  xor edi,edi
+  mov esi,4
+  mov edx,4
+  mov ecx,8
+  call gfx_fraction_rect
+.q_br:
+  test r15b,2              ; bottom-right
+  jz .handled
+  mov edi,4
+  mov esi,4
+  mov edx,8
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.rounded_box:
+  ; U+256D..2570 rounded corners. The three connecting pixels form a
+  ; small 4-connected arc, with horizontal/vertical arms reaching the
+  ; exact cell edges (no breaks where a curved corner meets a straight line).
+  sub edi,256dh
+  mov r15d,edi                  ; 0=down/right, 1=down/left,
+                                 ; 2=up/left,    3=up/right
+  call .prepare
+  cmp r15d,0
+  je .arc_right
+  cmp r15d,3
+  je .arc_right
+  ; Left arm, stopping two pixels before the vertical center.
+  xor edx,edx
+  mov r8d,[cell_w]
+  shr r8d,1
+  sub r8d,1
+  jmp .arc_hdraw
+.arc_right:
+  mov edx,[cell_w]
+  shr edx,1
+  add edx,2
+  mov r8d,[cell_w]
+  sub r8d,edx
+.arc_hdraw:
+  mov ecx,[cell_h]
+  shr ecx,1
+  mov r9d,1
+  call gfx_pixel_rect
+  ; Vertical arm, stopping two pixels before the horizontal center.
+  mov edx,[cell_w]
+  shr edx,1
+  cmp r15d,0
+  je .arc_down
+  cmp r15d,1
+  je .arc_down
+  xor ecx,ecx
+  mov r9d,[cell_h]
+  shr r9d,1
+  sub r9d,1
+  jmp .arc_vdraw
+.arc_down:
+  mov ecx,[cell_h]
+  shr ecx,1
+  add ecx,2
+  mov r9d,[cell_h]
+  sub r9d,ecx
+.arc_vdraw:
+  mov r8d,1
+  call gfx_pixel_rect
+  ; Join the arms with a smooth-ish three-pixel quarter bend.
+  mov edx,[cell_w]
+  shr edx,1
+  cmp r15d,0
+  je .arc_bend_right
+  cmp r15d,3
+  je .arc_bend_right
+  dec edx
+  jmp .arc_bend_first
+.arc_bend_right:
+  inc edx
+.arc_bend_first:
+  mov ecx,[cell_h]
+  shr ecx,1
+  mov r8d,1
+  mov r9d,1
+  call gfx_pixel_rect
+  mov edx,[cell_w]
+  shr edx,1
+  cmp r15d,0
+  je .arc_bend_second_right
+  cmp r15d,3
+  je .arc_bend_second_right
+  dec edx
+  jmp .arc_bend_second_x
+.arc_bend_second_right:
+  inc edx
+.arc_bend_second_x:
+  mov ecx,[cell_h]
+  shr ecx,1
+  cmp r15d,1
+  jle .arc_bend_second_down
+  dec ecx
+  jmp .arc_bend_second_draw
+.arc_bend_second_down:
+  inc ecx
+.arc_bend_second_draw:
+  mov r8d,1
+  mov r9d,1
+  call gfx_pixel_rect
+  mov edx,[cell_w]
+  shr edx,1
+  mov ecx,[cell_h]
+  shr ecx,1
+  cmp r15d,1
+  jle .arc_bend_third_down
+  dec ecx
+  jmp .arc_bend_third_draw
+.arc_bend_third_down:
+  inc ecx
+.arc_bend_third_draw:
+  mov r8d,1
+  mov r9d,1
+  call gfx_pixel_rect
+  jmp .handled
+.box:
+  sub edi,2500h
+  lea rax,[gfx_box_segments]
+  movzx r15d,byte [rax+rdi]
+  test r15d,r15d
+  jz .unhandled
+  call .prepare
+  ; Segment bits: 1=left, 2=right, 4=up, 8=down.
+  ; Every arm touches the cell edge; crossing arms overlap by one pixel.
+  test r15b,3
+  jz .box_vertical
+  xor edx,edx
+  test r15b,1
+  jnz .box_left_ok
+  mov edx,[cell_w]
+  shr edx,1
+.box_left_ok:
+  mov r8d,[cell_w]
+  test r15b,2
+  jnz .box_right_ok
+  shr r8d,1
+  inc r8d
+.box_right_ok:
+  sub r8d,edx
+  mov ecx,[cell_h]
+  shr ecx,1
+  mov r9d,1
+  call gfx_pixel_rect
+.box_vertical:
+  test r15b,12
+  jz .handled
+  mov edx,[cell_w]
+  shr edx,1
+  xor ecx,ecx
+  test r15b,4
+  jnz .box_up_ok
+  mov ecx,[cell_h]
+  shr ecx,1
+.box_up_ok:
+  mov r9d,[cell_h]
+  test r15b,8
+  jnz .box_down_ok
+  shr r9d,1
+  inc r9d
+.box_down_ok:
+  sub r9d,ecx
+  mov r8d,1
+  call gfx_pixel_rect
+  jmp .handled
+.upper_half:
+  call .prepare
+  xor edi,edi
+  xor esi,esi
+  mov edx,8
+  mov ecx,4
+  call gfx_fraction_rect
+  jmp .handled
+.lower_eighths:
+  sub edi,2580h
+  mov r15d,edi
+  call .prepare
+  xor edi,edi
+  mov esi,8
+  sub esi,r15d
+  mov edx,8
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.full:
+  call .prepare
+  xor edi,edi
+  xor esi,esi
+  mov edx,8
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.left_eighths:
+  mov r15d,2590h
+  sub r15d,edi
+  call .prepare
+  xor edi,edi
+  xor esi,esi
+  mov edx,r15d
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.right_half:
+  call .prepare
+  mov edi,4
+  xor esi,esi
+  mov edx,8
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.upper_eighth:
+  call .prepare
+  xor edi,edi
+  xor esi,esi
+  mov edx,8
+  mov ecx,1
+  call gfx_fraction_rect
+  jmp .handled
+.right_eighth:
+  call .prepare
+  mov edi,7
+  xor esi,esi
+  mov edx,8
+  mov ecx,8
+  call gfx_fraction_rect
+  jmp .handled
+.prepare:
+  push rdi
+  mov edi,ebx
+  call ensure_color
+  mov [gfx_color],rax
+  pop rdi
+  mov eax,r12d
+  imul eax,[cell_w]
+  add eax,PAD
+  mov [gfx_x],eax
+  ret
+.handled:
+  mov eax,1
+  ret
+.unhandled:
+  xor eax,eax
+  ret
+
 ; Render only dirty visible rows. Puts background rectangles first,
 ; then groups foreground glyphs into same-color runs.
 render:
@@ -2942,6 +3395,9 @@ render:
   mov edi,[r14+r12*8+4]
   call cell_colors
   mov ebx,eax                 ; foreground index
+  mov eax,[r14+r12*8+4]
+  and eax,11000000h           ; group runs by font face as well as color
+  mov [run_style],eax
   mov r15d,r12d              ; run beginning
   lea r9,[glyphs]
   xor r10d,r10d              ; characters in this run
@@ -2951,6 +3407,10 @@ render:
   test dword [r14+r12*8+4],8000000h
   jnz .fg_draw
   mov edi,[r14+r12*8+4]
+  mov eax,edi
+  and eax,11000000h
+  cmp eax,[run_style]
+  jne .fg_draw
   call cell_colors
   cmp eax,ebx
   jne .fg_draw
@@ -2977,11 +3437,14 @@ render:
   jmp .check_run
 .fg_actual:
   mov [run_len],r10d
+  mov edi,[run_style]
+  call select_font
+  mov [run_font],rax
   mov edi,ebx
   call ensure_color
   mov rdi,[draw]
   mov rsi,rax
-  mov rdx,[font]
+  mov rdx,[run_font]
   mov ecx,r15d
   imul ecx,[cell_w]
   add ecx,PAD
@@ -3004,16 +3467,24 @@ render:
   mov edi,[r14+r12*8+4]
   call cell_colors
   mov ebx,eax
+  mov edi,[r14+r12*8]
+  call draw_graphics
+  test eax,eax
+  jz .u_text
+  inc r12d
+  jmp .fg_loop
+.u_text:
+  mov edi,[r14+r12*8+4]
+  call select_font
+  mov [unicode_font_tmp],rax
+  mov rsi,rax
   mov rdi,[dpy]
-  mov rsi,[font]
   mov edx,[r14+r12*8]
   ccall XftCharExists
   ; XftCharExists may clobber RDX (a caller-saved argument register).
   ; Search our small fallback-font cache before asking Fontconfig to resolve
   ; this codepoint. In particular, monospace fonts often omit U+2800 braille
   ; even though another installed font contains it.
-  mov rdx,[font]
-  mov [unicode_font_tmp],rdx
   test eax,eax
   jnz .u_font_ready
   xor r15d,r15d
@@ -3643,6 +4114,38 @@ handle_key:
 .down:
   lea rsi,[seq_down]
 .arrow:
+  ; xterm modifier encoding: ESC [ 1 ; (1+Shift+2*Alt+4*Ctrl) A/B/C/D.
+  ; In particular, Ctrl+Left/Right must reach the shell as CSI 1;5D/C
+  ; so readline and other line editors can move by words. Modified keys
+  ; always use CSI, even when DECCKM application cursor mode is active.
+  mov eax,[key_state]
+  and eax,ShiftMask+Mod1Mask+ControlMask
+  jz .unmodified_arrow
+  mov ecx,1
+  test eax,ShiftMask
+  jz .no_shift
+  inc ecx
+.no_shift:
+  test eax,Mod1Mask
+  jz .no_alt
+  add ecx,2
+.no_alt:
+  test eax,ControlMask
+  jz .encode_modifier
+  add ecx,4
+.encode_modifier:
+  add ecx,'0'                   ; modifier parameter is a single digit 2..8
+  mov byte [arrow_buf],27
+  mov byte [arrow_buf+1],'['
+  mov byte [arrow_buf+2],'1'
+  mov byte [arrow_buf+3],';'
+  mov [arrow_buf+4],cl
+  mov al,[rsi+2]
+  mov [arrow_buf+5],al
+  lea rsi,[arrow_buf]
+  mov edx,6
+  jmp key_escape
+.unmodified_arrow:
   cmp byte [app_cursor],0
   je .normal_arrow
   ; Convert ESC [ A to ESC O A without rewriting the constants.
@@ -4247,6 +4750,9 @@ handle_selection_notify:
 section '.data' writeable
   title db 'fasterm - FASM X11 terminal',0
   font_spec db 'monospace:pixelsize=15:antialias=true',0
+  font_bold_spec db 'monospace:pixelsize=15:antialias=true:weight=bold',0
+  font_italic_spec db 'monospace:pixelsize=15:antialias=true:slant=italic',0
+  font_bolditalic_spec db 'monospace:pixelsize=15:antialias=true:weight=bold:slant=italic',0
   fallback_format db 'monospace:charset=%x:pixelsize=15:antialias=true',0
   empty db 0
   locale_utf8 db 'C.UTF-8',0
@@ -4264,6 +4770,7 @@ section '.data' writeable
   shell_name db 'SHELL',0
   fallback_shell db '/bin/sh',0
   opt_e db '-e',0
+  opt_stop_server db '--stop-server',0
   opt_server db '--server',0
   opt_client db '--client',0
   display_env db 'DISPLAY',0
@@ -4297,6 +4804,15 @@ section '.data' writeable
   error_pty_queue db 'fasterm: cannot queue PTY input',10,0
   status_ok db 27,'[0n'
   device_id db 27,'[?6c'
+  gfx_box_segments db 3,3,12,12,0,0,0,0,0,0,0,0,10,10,10,10
+  db 9,9,9,9,6,6,6,6,5,5,5,5,14,14,14,14
+  db 14,14,14,14,13,13,13,13,13,13,13,13,11,11,11,11
+  db 11,11,11,11,7,7,7,7,7,7,7,7,15,15,15,15
+  db 15,15,15,15,15,15,15,15,15,15,15,15,0,0,0,0
+  db 3,12,10,10,10,9,9,9,6,6,6,5,5,5,14,14
+  db 14,13,13,13,11,11,11,7,7,7,15,15,15,0,0,0
+  db 0,0,0,0,1,4,2,8,1,4,2,8,3,12,3,12
+  gfx_quadrants db 1,2,4,7,6,13,14,8,9,11
 
 ; The ring buffers below use `align 4096`. For ELF64 objects, FASM
 ; requires the section alignment to be at least the largest in-section align.
@@ -4307,6 +4823,7 @@ section '.bss' writeable align 4096
   server_sock rd 1
   server_client_sock rd 1
   server_uid rd 1
+  server_stop_status rd 1
   server_remaining rd 1
   server_cwd_len rd 1
   server_env_count rd 1
@@ -4327,6 +4844,13 @@ section '.bss' writeable align 4096
   visual rq 1
   cmap rq 1
   font rq 1
+  font_bold rq 1
+  font_italic rq 1
+  font_bolditalic rq 1
+  run_font rq 1
+  run_style rd 1
+  gfx_x rd 1
+  gfx_color rq 1
   width_metrics rb 12             ; XGlyphInfo (ASCII advance)
   glyph_clip rb 8                 ; XRectangle for Unicode ink
   border_color rq 1
@@ -4460,7 +4984,7 @@ section '.bss' writeable align 4096
   wrap_next rb 1
   dec_graphics rb 1
   onechar rb 1
-  arrow_buf rb 4
+  arrow_buf rb 6
   cursor_glyph rd 1
   keybuf rb 128
   mouse_buffer rb 64

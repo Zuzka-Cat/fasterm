@@ -1,0 +1,13 @@
+[Unit]
+Description=fasterm Ctrl+Alt+Return X11 hotkey
+Requires=fasterm-server.service
+After=fasterm-server.service
+# Restart the hotkey whenever the server restarts so the prepared socket
+# connection never points at an obsolete server/worker.
+PartOf=fasterm-server.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/fasterm-hotkey
+Restart=on-failure
+RestartSec=1s

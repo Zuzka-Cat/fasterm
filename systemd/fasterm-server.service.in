@@ -1,0 +1,14 @@
+[Unit]
+Description=fasterm preconnected terminal server
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/fasterm --server
+Restart=on-failure
+RestartSec=1s
+# The server forks preforked workers and real terminal windows. A terminal
+# that has been launched intentionally outlives the server; killing the
+# service cgroup would kill the user's open terminals on every update.
+# Idle workers receive SIGTERM through PR_SET_PDEATHSIG when the server exits.
+KillMode=process
