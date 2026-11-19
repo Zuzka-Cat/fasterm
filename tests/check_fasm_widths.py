@@ -20,7 +20,7 @@ for bits, names in [
 ]:
     REGS.update({name: bits for name in names.split()})
 
-SRC = Path(sys.argv[1] if len(sys.argv) > 1 else 'fastst.asm')
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else 'fasterm.asm')
 lines = SRC.read_text().splitlines()
 labels = {}
 for number, line in enumerate(lines, 1):

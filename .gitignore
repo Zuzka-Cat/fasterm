@@ -1,8 +1,8 @@
 *.o
 bench_data
-fastst-launch
-fastst
-fastst-hotkey
-fastst-hotkey-compat
-fastst-compat
-fastst-compat-lld
+fasterm-launch
+fasterm
+fasterm-hotkey
+fasterm-hotkey-compat
+fasterm-compat
+fasterm-compat-lld

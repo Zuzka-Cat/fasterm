@@ -22,8 +22,8 @@ static int target_text;
 static uint64_t time_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec; }
 static void add(const char *name, uint64_t a, uint64_t b) { unsigned i=__atomic_fetch_add(&ns,1,__ATOMIC_RELAXED); if(i < 256) stamps[i] = (struct stamp){name,a,b}; }
 __attribute__((constructor)) static void init_probe(void) {
-    const char *v=getenv("FASTST_BENCH_FD"); if(v) report_fd=atoi(v);
-    target_text = (getenv("FASTST_BENCH_TARGET") && strcmp(getenv("FASTST_BENCH_TARGET"),"text")==0);
+    const char *v=getenv("FASTERM_BENCH_FD"); if(v) report_fd=atoi(v);
+    target_text = (getenv("FASTERM_BENCH_TARGET") && strcmp(getenv("FASTERM_BENCH_TARGET"),"text")==0);
     uint64_t now=time_ns(); add("ldpreload_ctor",now,now);
 }
 #define TRACE_WRAP(T, name, params, args) \

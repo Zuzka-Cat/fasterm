@@ -21,8 +21,8 @@ p=argparse.ArgumentParser()
 p.add_argument('--runs',type=int,default=40)
 p.add_argument('--warmup',type=int,default=5)
 p.add_argument('--mode',choices=('frame','text'),default='frame')
-p.add_argument('--server',default='./fastst-compat-lld')
-p.add_argument('--hotkey',default='./fastst-hotkey-compat')
+p.add_argument('--server',default='./fasterm')
+p.add_argument('--hotkey',default='./fasterm-hotkey')
 p.add_argument('--probe',default='tests/startup_probe.so')
 p.add_argument('--csv',default='')
 a=p.parse_args()
@@ -39,10 +39,10 @@ xtst.XTestFakeKeyEvent.argtypes=[ct.c_void_p,ct.c_uint,ct.c_int,ct.c_ulong];xtst
 rd,wr=os.pipe()
 with tempfile.TemporaryDirectory() as tmp:
     script=pathlib.Path(tmp,'startup-shell')
-    script.write_text('#!/bin/sh\nprintf "FASTST_READY\\n"\nsleep 0.17\n');script.chmod(0o755)
+    script.write_text('#!/bin/sh\nprintf "FASTERM_READY\\n"\nsleep 0.17\n');script.chmod(0o755)
     env=os.environ.copy();env['SHELL']=str(script);env['PWD']=tmp
     server_env=env.copy()
-    server_env.update(LD_PRELOAD=probe,FASTST_BENCH_FD=str(wr),FASTST_BENCH_TARGET=a.mode)
+    server_env.update(LD_PRELOAD=probe,FASTERM_BENCH_FD=str(wr),FASTERM_BENCH_TARGET=a.mode)
     sv=subprocess.Popen([server,'--server'],env=server_env,cwd=tmp,pass_fds=(wr,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     os.close(wr)
     hk=None

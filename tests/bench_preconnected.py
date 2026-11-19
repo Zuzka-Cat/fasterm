@@ -20,8 +20,8 @@ p.add_argument('--warmup', type=int, default=5)
 p.add_argument('--mode', choices=('frame', 'text'), default='frame')
 p.add_argument('--seed', type=int, default=13)
 p.add_argument('--csv', default='')
-p.add_argument('--standalone', default='./bench_data/fastst-before-preconnect')
-p.add_argument('--updated', default='./fastst-compat-lld')
+p.add_argument('--standalone', default='./fasterm')
+p.add_argument('--updated', default='./fasterm')
 p.add_argument('--launcher', default='')
 p.add_argument('--probe', default='tests/startup_probe.so')
 a = p.parse_args()
@@ -47,7 +47,7 @@ def report(pipe, start):
 
 r,w=os.pipe()
 server_env=os.environ.copy()
-server_env.update(LD_PRELOAD=probe,FASTST_BENCH_FD=str(w),FASTST_BENCH_TARGET=a.mode)
+server_env.update(LD_PRELOAD=probe,FASTERM_BENCH_FD=str(w),FASTERM_BENCH_TARGET=a.mode)
 server=subprocess.Popen([updated,'--server'],env=server_env,pass_fds=(w,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
 os.close(w)
 try:
@@ -56,12 +56,12 @@ try:
     rng=random.Random(a.seed)
     cases=[v for _ in range(a.runs+a.warmup) for v in rng.sample(('standalone','preconnected'),2)]
     results={'standalone':[],'preconnected':[]}
-    script="printf 'FASTST_READY\\n'; sleep 0.18"
+    script="printf 'FASTERM_READY\\n'; sleep 0.18"
     for idx,kind in enumerate(cases):
         if kind=='standalone':
             rd,wr=os.pipe()
             env=os.environ.copy()
-            env.update(LD_PRELOAD=probe,FASTST_BENCH_FD=str(wr),FASTST_BENCH_TARGET=a.mode)
+            env.update(LD_PRELOAD=probe,FASTERM_BENCH_FD=str(wr),FASTERM_BENCH_TARGET=a.mode)
             start=time.monotonic_ns()
             proc=subprocess.Popen([standalone,'-e','/bin/sh','-c',script],env=env,pass_fds=(wr,),stderr=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
             os.close(wr)

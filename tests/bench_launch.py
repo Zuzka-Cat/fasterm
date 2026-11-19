@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 
-binary = sys.argv[1] if len(sys.argv) > 1 else './fastst-compat-gas'
+binary = sys.argv[1] if len(sys.argv) > 1 else './fasterm'
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 40
 samples = []
 for i in range(count):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end fastst preconnected-worker launcher regression under Xvfb.
+"""End-to-end fasterm preconnected-worker launcher regression under Xvfb.
 
 Exercises real command launching, caller environment, cwd, multiple windows,
 malformed same-uid requests, and overlong request rejection. An isolated Xvfb
@@ -26,7 +26,7 @@ try:
     if server.poll() is not None:
         raise RuntimeError('preconnected server failed: '+server.stderr.read().decode())
     # An untrusted/malformed local request must not kill the warm worker.
-    name=(f'fastst-v3:{os.geteuid()}:{os.environ["DISPLAY"]}').encode()
+    name=(f'fasterm-v3:{os.geteuid()}:{os.environ["DISPLAY"]}').encode()
     address=(b'\0'+name)[:108].ljust(108,b'\0')
     with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as s:
         s.connect(address)
@@ -35,10 +35,10 @@ try:
     with tempfile.TemporaryDirectory() as tmp:
         out=pathlib.Path(tmp,'output.txt')
         env=os.environ.copy()
-        env['FASTST_IPC_TEST']='ENV_OK'
-        env['FASTST_LONG_ENV']='Q'*14000
+        env['FASTERM_IPC_TEST']='ENV_OK'
+        env['FASTERM_LONG_ENV']='Q'*14000
         # Check the actual PTY child, not merely the launcher's exit status.
-        cmd=f'printf "%s\\n%s\\n%s\\n" "$FASTST_IPC_TEST" "$PWD" "$FASTST_LONG_ENV" > {shlex.quote(str(out))}'
+        cmd=f'printf "%s\\n%s\\n%s\\n" "$FASTERM_IPC_TEST" "$PWD" "$FASTERM_LONG_ENV" > {shlex.quote(str(out))}'
         proc=subprocess.run([launcher,'-e','/bin/sh','-c',cmd],cwd=tmp,env=env,
                             capture_output=True,timeout=4)
         assert proc.returncode==0,(proc.returncode,proc.stderr)
@@ -59,7 +59,7 @@ try:
         windows=0
         for _ in range(50):
             tree=subprocess.run(['xwininfo','-root','-tree'],capture_output=True,text=True,timeout=3).stdout
-            ids=re.findall(r'(0x[0-9a-fA-F]+) "fastst - FASM X11 terminal"',tree)
+            ids=re.findall(r'(0x[0-9a-fA-F]+) "fasterm - FASM X11 terminal"',tree)
             # Idle workers precreate UNMAPPED X windows; they must not count as
             # launched/visible terminals. Check actual X11 Map State instead.
             mapped=0
@@ -75,7 +75,7 @@ try:
 
     # Over-sized environment must fail closed, not overflow or silently drop.
     huge_env=os.environ.copy()
-    huge_env['FASTST_ENV_OVERFLOW_TEST']='Y'*42000
+    huge_env['FASTERM_ENV_OVERFLOW_TEST']='Y'*42000
     proc=subprocess.run([launcher,'-e','/bin/true'],env=huge_env,capture_output=True,timeout=5)
     assert proc.returncode!=0,'Oversized environment did not reject launch'
 

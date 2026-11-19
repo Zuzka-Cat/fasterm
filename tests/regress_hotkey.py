@@ -25,7 +25,7 @@ t.XTestFakeKeyEvent.argtypes=[ct.c_void_p,ct.c_uint,ct.c_int,ct.c_ulong]
 
 def mapped():
     tree=subprocess.run(['xwininfo','-root','-tree'],text=True,capture_output=True,timeout=3).stdout
-    ids=re.findall(r'(0x[0-9a-fA-F]+) "fastst - FASM X11 terminal"',tree)
+    ids=re.findall(r'(0x[0-9a-fA-F]+) "fasterm - FASM X11 terminal"',tree)
     return sum('Map State: IsViewable' in subprocess.run(['xwininfo','-id',ident],text=True,capture_output=True,timeout=3).stdout for ident in ids)
 
 with tempfile.TemporaryDirectory() as tmp:

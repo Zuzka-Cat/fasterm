@@ -39,11 +39,11 @@ order=[b for i in range(a.warmup + a.runs) for b in rng.sample(paths,len(paths))
 for idx,b in enumerate(order):
     r,w=os.pipe()
     env=os.environ.copy()
-    env['FASTST_BENCH_FD']=str(w)
-    env['FASTST_BENCH_TARGET']=a.mode
+    env['FASTERM_BENCH_FD']=str(w)
+    env['FASTERM_BENCH_TARGET']=a.mode
     env['LD_PRELOAD']=str(pathlib.Path(a.probe).resolve())
     t0=time.monotonic_ns()
-    proc=subprocess.Popen([b,'-e','/bin/sh','-c',"printf 'FASTST_READY\\n'; exec cat"],env=env,
+    proc=subprocess.Popen([b,'-e','/bin/sh','-c',"printf 'FASTERM_READY\\n'; exec cat"],env=env,
        pass_fds=(w,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     os.close(w)
     # Probe writes the entire record as one write; forkpty children may hold

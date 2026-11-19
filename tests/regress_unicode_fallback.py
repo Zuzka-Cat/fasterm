@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify that an XftCharExists() clobber of caller-saved RDX cannot crash fastst.
+"""Verify that an XftCharExists() clobber of caller-saved RDX cannot crash fasterm.
 
-Usage: python3 tests/regress_unicode_fallback.py ./fastst
+Usage: python3 tests/regress_unicode_fallback.py ./fasterm
 Requires: cc, xvfb-run and Xft installed. Builds a test-only LD_PRELOAD shim.
 """
 import os
@@ -30,7 +30,7 @@ void XftDrawString32(void *d, void *color, void *font, int x, int y,
     static void (*next)(void*,void*,void*,int,int,const unsigned int*,int);
     if (!next) next = dlsym(RTLD_NEXT,"XftDrawString32");
     if (s && n > 0 && s[0] == 0x25BD)
-        (void)write(STDERR_FILENO, "FASTST_UNICODE_RENDERED\n", 24);
+        (void)write(STDERR_FILENO, "FASTERM_UNICODE_RENDERED\n", 24);
     next(d,color,font,x,y,s,n);
 }
 '''
@@ -58,11 +58,11 @@ def child(binary: str, shim: str) -> int:
                 if not block:
                     break
                 data += block
-                if b"FASTST_UNICODE_RENDERED" in data:
+                if b"FASTERM_UNICODE_RENDERED" in data:
                     break
             if proc.poll() is not None:
                 break
-        if b"FASTST_UNICODE_RENDERED" not in data:
+        if b"FASTERM_UNICODE_RENDERED" not in data:
             print("FAIL: Unicode rendering was not observed; exit:", proc.poll(),
                   "stderr:", data.decode(errors="replace"), flush=True)
             return 1
@@ -90,7 +90,7 @@ def main() -> int:
         print(__doc__)
         return 2
     binary = str(pathlib.Path(sys.argv[1]).resolve())
-    with tempfile.TemporaryDirectory(prefix="fastst-fallback-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="fasterm-fallback-") as tmp:
         src = pathlib.Path(tmp) / "shim.c"
         so = pathlib.Path(tmp) / "shim.so"
         src.write_text(SHIM)

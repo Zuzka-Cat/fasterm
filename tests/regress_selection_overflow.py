@@ -2,7 +2,7 @@
 """X11 regression for historical clipboard overflow with very long selections.
 
 Needs an *unstripped* executable so nm can locate the clipboard buffer in .bss.
-Run: xvfb-run -a python3 tests/regress_selection_overflow.py ./fastst-compat-debug
+Run: xvfb-run -a python3 tests/regress_selection_overflow.py ./fasterm-compat-debug
 """
 import re
 import os
@@ -31,7 +31,7 @@ def symbol_addr(name):
     p = subprocess.check_output(['nm', BINARY], text=True)
     m = re.search(r'^([0-9a-fA-F]+) [bBdD] '+re.escape(name)+r'$', p, re.M)
     if not m:
-        raise RuntimeError(f'{name} not found: use unstripped fastst-compat-debug executable')
+        raise RuntimeError(f'{name} not found: use unstripped fasterm-compat-debug executable')
     return int(m[1], 16)
 
 def read_mem(pid, addr, length):

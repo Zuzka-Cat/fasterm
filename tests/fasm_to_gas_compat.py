@@ -4,6 +4,10 @@ out=['.intel_syntax noprefix']
 inmacro=False
 section=''
 parent='top'
+constants=set()
+for raw in src:
+    found=re.match(r'^\s*(\w+)\s*=\s*',raw)
+    if found: constants.add(found.group(1))
 
 def split_args(s):
     args=[]; item=''; quote=False
@@ -36,7 +40,8 @@ for raw in src:
         out.append('.section '+section);continue
     if re.match(r'^\w+\s*=\s*',line):
         name,val=line.split('=',1)
-        out.append('.set '+name.strip()+','+re.sub(r'\b([0-9A-Fa-f]+)h\b',lambda m:'0x'+m.group(1),val.strip()));continue
+        constants.add(name.strip())
+        out.append('.set '+name.strip()+','+re.sub(r'\b([0-9A-Fa-f]+)h\b',lambda m:'0x'+m.group(1),val.strip().replace('$','.')));continue
     if line.startswith('align '):out.append('.balign '+line[6:]);continue
     if re.match(r'^(db|dd|dq)\s+',line):
         k, v = line.split(' ',1)
@@ -69,6 +74,11 @@ for raw in src:
         else:
             out.append('.L_'+parent+'_'+name[1:]+':')
         continue
+    # FASM symbolic equates are immediates; GAS Intel syntax otherwise
+    # interprets a bare symbol as an absolute memory load (e.g. err_len).
+    mt=re.fullmatch(r'(mov\s+\w+\s*,\s*)(\w+)',line)
+    if mt and mt.group(2) in constants:
+        line=mt.group(1)+'OFFSET FLAT:'+mt.group(2)
     # Replace local label names (including relative jumps)
     line=re.sub(r'(?<!\w)\.(\w+)',lambda m:'.L_'+parent+'_'+m.group(1),line)
     # FASM 0AAh style hex values; keep as hex literal

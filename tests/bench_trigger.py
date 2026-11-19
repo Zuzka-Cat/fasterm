@@ -23,9 +23,9 @@ p.add_argument('--warmup',type=int,default=5)
 p.add_argument('--mode',choices=('frame','text'),default='text')
 p.add_argument('--seed',type=int,default=15)
 p.add_argument('--csv',default='')
-p.add_argument('--server',default='./fastst-compat-lld')
-p.add_argument('--launcher',default='./fastst-launch-compat')
-p.add_argument('--trigger',default='./fastst-trigger-compat')
+p.add_argument('--server',default='./fasterm')
+p.add_argument('--launcher',default='./fasterm-launch')
+p.add_argument('--trigger',default='./fasterm-hotkey')
 p.add_argument('--probe',default='tests/startup_probe.so')
 a=p.parse_args()
 if 'DISPLAY' not in os.environ:p.error('Run under xvfb-run or an X11 server')
@@ -33,7 +33,7 @@ server,launcher,trigger,probe=(str(pathlib.Path(x).resolve()) for x in (a.server
 
 with tempfile.TemporaryDirectory() as tmp:
     script=pathlib.Path(tmp,'startup-shell')
-    script.write_text('#!/bin/sh\nprintf "FASTST_READY\\n"\nsleep 0.17\n')
+    script.write_text('#!/bin/sh\nprintf "FASTERM_READY\\n"\nsleep 0.17\n')
     script.chmod(0o755)
     rd,wr=os.pipe()
     env=os.environ.copy()
@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory() as tmp:
     env['PS1']=''
     # The tracer never affects the launcher (no LD_PRELOAD in either launch client).
     server_env=env.copy()
-    server_env.update(LD_PRELOAD=probe,FASTST_BENCH_FD=str(wr),FASTST_BENCH_TARGET=a.mode)
+    server_env.update(LD_PRELOAD=probe,FASTERM_BENCH_FD=str(wr),FASTERM_BENCH_TARGET=a.mode)
     proc=subprocess.Popen([server,'--server'],cwd=tmp,env=server_env,pass_fds=(wr,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     os.close(wr)
     # One complete report is written atomically (a few KiB) per worker. No

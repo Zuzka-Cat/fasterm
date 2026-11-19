@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real Vim alternate-screen restoration test under Xvfb.
 
-Run: xvfb-run -a python3 tests/regress_vim_exit.py ./fastst
+Run: xvfb-run -a python3 tests/regress_vim_exit.py ./fasterm
 """
 import subprocess
 import sys
@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from regress_scrollback_input import wait, find_window, size, grab, send_key, x
 
-BIN = str(Path(sys.argv[1] if len(sys.argv)>1 else './fastst').resolve())
+BIN = str(Path(sys.argv[1] if len(sys.argv)>1 else './fasterm').resolve())
 CHILD = r'''import os,subprocess,sys,time
 from pathlib import Path
 p=Path(sys.argv[1])

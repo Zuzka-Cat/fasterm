@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic PTY/ANSI/parser + X11 resize stress test.
 
-Run: xvfb-run -a python3 tests/regress_escape_stress.py ./fastst-compat-gas
+Run: xvfb-run -a python3 tests/regress_escape_stress.py ./fasterm-compat-gas
 """
 import ctypes as C
 import os

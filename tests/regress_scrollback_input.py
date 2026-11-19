@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Xvfb regression: PgUp/PgDn, keyboard snap-to-live, selection scroll binding.
 
-Run: xvfb-run -a python3 tests/regress_scrollback_input.py ./fastst
+Run: xvfb-run -a python3 tests/regress_scrollback_input.py ./fasterm
 Requires Xvfb, libX11 and xwininfo; no OCR or extra input-injection tools.
 """
 import ctypes as C
@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-BIN = str(Path(sys.argv[1] if len(sys.argv)>1 else './fastst').resolve())
+BIN = str(Path(sys.argv[1] if len(sys.argv)>1 else './fasterm').resolve())
 CHILD = r'''import os, sys, time, tty
 from pathlib import Path
 p = Path(sys.argv[1])
@@ -73,7 +73,7 @@ def wait(fn, seconds=6):
 def find_window():
     r=subprocess.run(['xwininfo','-root','-tree'], text=True,capture_output=True)
     for line in r.stdout.splitlines():
-        if 'fastst' in line:
+        if 'fasterm' in line:
             m=re.search(r'0x[0-9a-fA-F]+',line)
             if m:return int(m[0],16)
 

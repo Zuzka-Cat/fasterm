@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pixel-compare normal screen before/after Vim-style ?1049 switches.
 
-Run: xvfb-run -a python3 tests/regress_altscreen_restore.py ./fastst
+Run: xvfb-run -a python3 tests/regress_altscreen_restore.py ./fasterm
 Requires libX11, xwininfo and Xvfb (xorg-server-xvfb).
 """
 import ctypes
@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-BIN = str(Path(sys.argv[1] if len(sys.argv) > 1 else './fastst').resolve())
+BIN = str(Path(sys.argv[1] if len(sys.argv) > 1 else './fasterm').resolve())
 
 CHILD = '''import os, sys, time
 from pathlib import Path
@@ -55,7 +55,7 @@ def until(check, timeout=6):
 def window_id():
     r = subprocess.run(['xwininfo', '-root', '-tree'], text=True, capture_output=True)
     for line in r.stdout.splitlines():
-        if 'fastst' in line:
+        if 'fasterm' in line:
             m = re.search(r'0x[0-9a-fA-F]+', line)
             if m:
                 return m.group(0)
