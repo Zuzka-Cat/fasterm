@@ -47,6 +47,7 @@ extrn fork
 extrn signal
 extrn kill
 extrn getuid
+extrn getpwuid
 extrn geteuid
 extrn snprintf
 extrn getcwd
@@ -1021,6 +1022,35 @@ spawn_shell:
   lea rsi,[rbx+16]
   ccall execvp
 .default:
+  ; Explicit override only. SHELL is often inherited from a stale systemd
+  ; user manager (e.g. bash even after chsh changes the login shell to ash).
+  lea rdi,[override_shell_name]
+  ccall getenv
+  test rax,rax
+  jz .login_shell
+  cmp byte [rax],0
+  jz .login_shell
+  mov [shell_ptr],rax
+  jmp .exec
+.login_shell:
+  ; glibc struct passwd on x86-64: pw_shell is the pointer at offset 40.
+  ; NSS honors the configured account shell, including chsh and nonlocal users.
+  ; This lookup must happen in the PTY child, after receiving the full launch
+  ; request, so forwarded stale SHELL values cannot override the login shell.
+  ccall getuid
+  mov edi,eax
+  ccall getpwuid
+  test rax,rax
+  jz .environment_fallback
+  mov rax,qword [rax+40]
+  test rax,rax
+  jz .environment_fallback
+  cmp byte [rax],0
+  jz .environment_fallback
+  mov [shell_ptr],rax
+  jmp .exec
+.environment_fallback:
+  ; NSS failure: keep conventional fallback behavior, then /bin/sh.
   lea rdi,[shell_name]
   ccall getenv
   test rax,rax
@@ -1033,6 +1063,11 @@ spawn_shell:
   lea rax,[fallback_shell]
   mov [shell_ptr],rax
 .exec:
+  ; Keep the environment consistent with the shell actually launched.
+  lea rdi,[shell_name]
+  mov rsi,[shell_ptr]
+  mov edx,1
+  ccall setenv
   mov rax,[shell_ptr]
   mov [sh_argv],rax
   mov rdi,rax
@@ -4768,6 +4803,7 @@ section '.data' writeable
   color_name db 'COLORTERM',0
   color_value db 'truecolor',0
   shell_name db 'SHELL',0
+  override_shell_name db 'FASTERM_SHELL',0
   fallback_shell db '/bin/sh',0
   opt_e db '-e',0
   opt_stop_server db '--stop-server',0

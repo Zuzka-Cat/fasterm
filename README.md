@@ -96,6 +96,21 @@ fasterm-launch                # fast client of that server
 fasterm-hotkey &              # Ctrl+Alt+Return daemon
 ```
 
+### Default shell
+
+By default fasterm starts the login shell configured for your user account
+(`chsh`, via the NSS passwd database), **not** a possibly stale `$SHELL`
+variable inherited from i3 or a systemd user service. This applies to direct
+launches, the dedicated hotkey, and `fasterm-launch`. It also sets `SHELL` in
+the new process to match the selected shell. If the account lookup is
+unavailable, it falls back to `$SHELL`, then `/bin/sh`.
+
+To deliberately use a different shell without changing your account, set
+`FASTERM_SHELL=/path/to/shell` in fasterm's launch environment. An explicit
+`fasterm -e program ...` or `fasterm-launch -e program ...` still takes
+precedence. After `chsh`, `make restart` is enough to refresh the managed
+server/hotkey setup; i3 need not restart.
+
 Ctrl+Left and Ctrl+Right send standard xterm word-navigation key sequences
 (`CSI 1;5D` and `CSI 1;5C`). Shift/Alt/Ctrl combinations of the
 arrow keys use the corresponding xterm modifier sequences. Actual word

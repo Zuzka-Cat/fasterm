@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory() as directory:
     shell.write_text(f'#!/bin/sh\necho ready >> "{marker}"\nexec sleep 15\n')
     shell.chmod(0o755)
     env = os.environ.copy()
-    env['SHELL'] = str(shell)
+    env['FASTERM_SHELL'] = str(shell)
     dpy = x.XOpenDisplay(None)
     assert dpy, 'XOpenDisplay failed'
     keys = [x.XKeysymToKeycode(dpy, x.XStringToKeysym(name)) for name in

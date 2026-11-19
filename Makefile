@@ -117,6 +117,7 @@ check: $(PROGRAMS) check-services
 # More expensive end-to-end server tests; needs XTest (libXtst).
 check-server: $(PROGRAMS)
 	xvfb-run -a python3 tests/regress_preconnected.py ./fasterm ./fasterm-launch
+	xvfb-run -a python3 tests/regress_login_shell.py ./fasterm ./fasterm-launch
 	xvfb-run -a python3 tests/regress_hotkey.py ./fasterm ./fasterm-hotkey
 	xvfb-run -a python3 tests/regress_server_restart.py ./fasterm ./fasterm-hotkey
 

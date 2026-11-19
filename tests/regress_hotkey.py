@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory() as tmp:
     script=pathlib.Path(tmp,'test-shell')
     script.write_text(f'#!/bin/sh\nprintf "HI\\n" >> "{path}"\nsleep 1.5\n')
     script.chmod(0o755)
-    env=os.environ.copy();env['SHELL']=str(script)
+    env=os.environ.copy();env['FASTERM_SHELL']=str(script)
     srv=subprocess.Popen([server,'--server'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     hk=None;dpy=None
     try:

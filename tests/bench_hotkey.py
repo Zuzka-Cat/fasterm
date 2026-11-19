@@ -40,7 +40,7 @@ rd,wr=os.pipe()
 with tempfile.TemporaryDirectory() as tmp:
     script=pathlib.Path(tmp,'startup-shell')
     script.write_text('#!/bin/sh\nprintf "FASTERM_READY\\n"\nsleep 0.17\n');script.chmod(0o755)
-    env=os.environ.copy();env['SHELL']=str(script);env['PWD']=tmp
+    env=os.environ.copy();env['FASTERM_SHELL']=str(script);env['PWD']=tmp
     server_env=env.copy()
     server_env.update(LD_PRELOAD=probe,FASTERM_BENCH_FD=str(wr),FASTERM_BENCH_TARGET=a.mode)
     sv=subprocess.Popen([server,'--server'],env=server_env,cwd=tmp,pass_fds=(wr,),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)

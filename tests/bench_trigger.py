@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory() as tmp:
     script.chmod(0o755)
     rd,wr=os.pipe()
     env=os.environ.copy()
-    env['SHELL']=str(script)
+    env['FASTERM_SHELL']=str(script)
     env['PWD']=tmp
     env['PS1']=''
     # The tracer never affects the launcher (no LD_PRELOAD in either launch client).
