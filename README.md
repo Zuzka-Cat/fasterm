@@ -9,7 +9,7 @@ Requires FASM 1.73, GCC, X11, Xft, Fontconfig, and libutil.
 On Arch Linux, build and install with:
 
 ```sh
-sudo pacman -S fasm gcc libx11 libxft
+sudo pacman -S fasm gcc libx11 libxft libxrender libxrandr
 make
 sudo make install
 ```
@@ -67,7 +67,7 @@ Modifier combinations for arrow keys use standard xterm escape sequences, includ
 ## Tests
 
 ```sh
-make check             # Python, Xvfb, xwininfo, Vim
+make check             # FASM/XRandR layout checks, Python, Xvfb, Vim
 make check-server      # also requires XTest
 make check-services    # no X11 session required
 make clean

@@ -1,6 +1,6 @@
 ; fasterm -- a compact x86-64 terminal emulator for Linux/X11, Flat Assembler syntax.
 ; Inspired by st's terminal/pty/X11 architecture; independently implemented.
-; Build: fasm fasterm.asm fasterm.o && gcc -no-pie -Wl,-z,relro -s -o fasterm fasterm.o -lX11 -l:libXft.so.2 -lutil
+; Build: make (FASM source, linked with X11/Xft/XRender/XRandR libraries)
 ;
 ; Deliberate hot-path design:
 ;   8 bytes/cell, 256-cell stride, 2048-line ring, O(1) full-screen scroll.
@@ -10,6 +10,7 @@ format ELF64
 include 'include/protocol.inc'
 include 'include/sysv64.inc'
 include 'include/x11.inc'
+include 'include/xrandr.inc'
 include 'include/cell.inc'
 public main
 extrn XOpenDisplay
@@ -33,6 +34,17 @@ extrn XConnectionNumber
 extrn XLookupString
 extrn XFlush
 extrn XSync
+extrn XftDrawPicture
+extrn XRenderFillRectangles
+extrn XRRQueryExtension
+extrn XRRQueryVersion
+extrn XRRSelectInput
+extrn XRRGetScreenResourcesCurrent
+extrn XRRGetScreenResources
+extrn XRRFreeScreenResources
+extrn XRRGetCrtcInfo
+extrn XRRFreeCrtcInfo
+extrn XTranslateCoordinates
 extrn XDestroyWindow
 extrn XftFontOpenName
 extrn pthread_create
@@ -85,6 +97,8 @@ extrn fcntl
 extrn read
 extrn write
 extrn poll
+extrn ppoll
+extrn clock_gettime
 extrn close
 extrn _exit
 extrn strcmp
@@ -309,6 +323,9 @@ main:
   mov rcx,[cmap]
   ccall XftDrawCreate
   mov [draw],rax
+  mov rdi,rax
+  ccall XftDrawPicture
+  mov [draw_picture],rax
 
   ; WM_DELETE_WINDOW protocol
   mov rdi,[dpy]
@@ -430,17 +447,60 @@ main:
   mov dword [pollfds+POLLFD_BYTES+PollFd.fd],eax
   mov word [pollfds+POLLFD_BYTES+PollFd.events],POLLIN
 
+  ; Select XRandR CRTC/output change events on the root window. Refresh
+  ; rate comes from the *active monitor's mode*, never a hard-coded 60 Hz.
+  mov rdi,[dpy]
+  mov rsi,[root]
+  call randr_watch
+  mov [randr_event_base],eax
+  mov byte [refresh_pending],2
+
 .event_loop:
   call drain_x_events
+  cmp byte [refresh_pending],0
+  je .refresh_done
+  movzx r9d,byte [refresh_pending]
+  mov byte [refresh_pending],0
+  cmp dword [randr_event_base],0
+  jl .refresh_done                ; extension absent, no speculative clock
+  mov rdi,[dpy]
+  mov rsi,[root]
+  mov rdx,[win]
+  mov ecx,[width]
+  mov r8d,[height]
+  call randr_refresh_interval_ns
+  cmp rax,[frame_interval_ns]
+  je .refresh_done
+  mov [frame_interval_ns],rax
+  mov qword [next_frame_ns],0     ; rate/monitor changed: no stale deadline
+.refresh_done:
   call check_cursor
   cmp byte [dirty_any],0
   je .no_draw
+  cmp qword [frame_interval_ns],0
+  je .draw_now                   ; no XRandR clock: never assume 60 Hz
+  call frame_clock
+  cmp rax,[next_frame_ns]
+  jae .frame_due
+  mov rcx,[next_frame_ns]
+  sub rcx,rax
+  mov qword [frame_wait],0
+  mov [frame_wait+8],rcx        ; nanosecond ppoll timeout
+  lea rdx,[frame_wait]
+  jmp .wait
+.frame_due:
+  mov rcx,[frame_interval_ns]
+  add rcx,rax
+  mov [next_frame_ns],rcx      ; schedule from *start*, not end of draw
+.draw_now:
   call render
 .no_draw:
+  xor edx,edx                  ; no pending frame: block until input
+.wait:
   lea rdi,[pollfds]
   mov esi,2
-  mov edx,-1
-  ccall poll
+  xor ecx,ecx                  ; no signal-mask replacement
+  ccall ppoll
   test eax,eax
   js .event_loop
   ; Resume buffered input whenever the PTY becomes writable.
@@ -486,6 +546,61 @@ main:
   ccall XDestroyWindow
   xor eax,eax
   leave
+  ret
+
+; Monotonic nanoseconds; used only while a dirty frame needs pacing.
+; The event loop continues parsing PTY/X events while waiting for the next
+; scanout opportunity instead of submitting frames that cannot be displayed.
+frame_clock:
+  mov edi,1                     ; CLOCK_MONOTONIC
+  lea rsi,[frame_now]
+  ccall clock_gettime
+  mov rax,[frame_now]
+  imul rax,1000000000
+  add rax,[frame_now+8]
+  ret
+
+; The XRandR library ABI and helpers are pure FASM.
+include 'include/randr_impl.inc'
+
+; rdi = XftColor*, rsi = XRectangle*, edx = count.
+; Modern Xorg: a single bulk RENDER fill; older X servers without RENDER:
+; preserve the original XftDrawRect implementation instead of BadPicture.
+fill_rectangles:
+  push rbx
+  push r12
+  push r13
+  mov rbx,rdi
+  mov r12,rsi
+  mov r13d,edx
+  cmp qword [draw_picture],0
+  je .fallback
+  lea rcx,[rbx+XftColor.color]
+  mov rdi,[dpy]
+  mov esi,1                     ; PictOpSrc
+  mov rdx,[draw_picture]
+  mov r8,r12
+  mov r9d,r13d
+  ccall XRenderFillRectangles
+  jmp .done
+.fallback:
+  test r13d,r13d
+  jz .done
+.loop:
+  mov rdi,[draw]
+  mov rsi,rbx
+  movsx edx,word [r12+XRectangle.x]
+  movsx ecx,word [r12+XRectangle.y]
+  movzx r8d,word [r12+XRectangle.width]
+  movzx r9d,word [r12+XRectangle.height]
+  ccall XftDrawRect
+  add r12,XRECTANGLE_BYTES
+  dec r13d
+  jnz .loop
+.done:
+  pop r13
+  pop r12
+  pop rbx
   ret
 
 fatal:
@@ -3273,6 +3388,65 @@ render:
   push r13
   push r14
   push r15
+  ; All dirty rows receive the same default background. Collect adjacent
+  ; rows into bands, and submit those bands as *one* XRender request rather
+  ; than one XftDrawRect call per dirty row.
+  mov dword [bg_rect_count],0
+  xor r12d,r12d
+.bg_collect:
+  cmp r12d,[rows]
+  jge .bg_submit
+  cmp byte [dirty+r12],0
+  je .bg_collect_next
+  mov edx,[bg_rect_count]
+  test edx,edx
+  jz .bg_new
+  mov eax,[bg_last_row]
+  inc eax
+  cmp eax,r12d
+  jne .bg_new
+  dec edx
+  lea rbx,[bg_rects+rdx*8]
+  movzx ecx,word [rbx+XRectangle.height]
+  add ecx,[cell_h]
+  cmp ecx,65535                 ; XRectangle height is only 16 bits
+  ja .bg_band_overflow
+  mov [rbx+XRectangle.height],cx
+  jmp .bg_accepted
+.bg_band_overflow:
+  inc edx                      ; start another band, keep the old one
+.bg_new:
+  lea rbx,[bg_rects+rdx*8]
+  mov word [rbx+XRectangle.x],PAD
+  mov eax,r12d
+  imul eax,[cell_h]
+  add eax,PAD
+  mov [rbx+XRectangle.y],ax
+  mov eax,[width]
+  sub eax,PAD*2
+  jg .bg_width_ok
+  mov eax,1
+.bg_width_ok:
+  mov [rbx+XRectangle.width],ax
+  mov eax,[cell_h]
+  mov [rbx+XRectangle.height],ax
+  inc dword [bg_rect_count]
+.bg_accepted:
+  mov [bg_last_row],r12d
+.bg_collect_next:
+  inc r12d
+  jmp .bg_collect
+.bg_submit:
+  cmp dword [bg_rect_count],0
+  je .bg_done
+  xor edi,edi
+  call ensure_color
+  mov rdi,rax
+  lea rsi,[bg_rects]
+  mov edx,[bg_rect_count]
+  call fill_rectangles
+.bg_done:
+  mov byte [paint_cursor],0
   mov byte [dirty_any],0
   xor r13d,r13d
 .row:
@@ -3282,6 +3456,10 @@ render:
   cmp byte [rax+r13],0
   je .row_next
   mov byte [rax+r13],0
+  cmp r13d,[cursor_y]
+  jne .not_cursor_row
+  mov byte [paint_cursor],1
+.not_cursor_row:
   mov eax,r13d
   call visaddr
   mov r14,rax                 ; 256 8-byte cells
@@ -3289,17 +3467,7 @@ render:
   imul eax,[cell_h]
   add eax,PAD
   mov [paint_y],eax
-  ; fill the whole row once with the default background
-  xor edi,edi
-  call ensure_color
-  mov rsi,rax
-  mov rdi,[draw]
-  mov edx,PAD
-  mov ecx,[paint_y]
-  mov r8d,[width]
-  sub r8d,PAD*2
-  mov r9d,[cell_h]
-  ccall XftDrawRect
+  ; Default backgrounds are already submitted together above.
   ; background runs: only nondefault background
   xor r12d,r12d
 .bg_loop:
@@ -3445,7 +3613,22 @@ render:
   inc ecx
   jmp .check_run
 .fg_actual:
-  mov [run_len],r10d
+  ; Trim blank *edges* of a run. Sending a 256-glyph run for a single
+  ; visible letter wastes glyph work and X11 request bytes. Interior
+  ; spaces must stay to preserve terminal-cell positioning.
+  mov edx,r10d
+.trim_last:
+  dec edx
+  cmp edx,ecx
+  jle .trim_done
+  cmp dword [r9+rdx*4],' '
+  je .trim_last
+.trim_done:
+  sub edx,ecx
+  inc edx
+  mov [run_len],edx
+  mov [run_glyph_offset],ecx
+  add r15d,ecx
   mov edi,[run_style]
   call select_font
   mov [run_font],rax
@@ -3459,7 +3642,8 @@ render:
   add ecx,PAD
   mov r8d,[paint_y]
   add r8d,[ascent]
-  lea r9,[glyphs]
+  mov eax,[run_glyph_offset]
+  lea r9,[glyphs+rax*4]
   ; Dedicated 7-arg call with fixed stack restore using global variable.
   mov [stack_save],rsp
   and rsp,-16
@@ -3639,6 +3823,9 @@ render:
   inc r13d
   jmp .row
 .cursor:
+  ; If this frame did not touch the cursor row, its pixels are still intact.
+  cmp byte [paint_cursor],0
+  je .flush
   cmp dword [cursor_show],0
   je .flush
   cmp dword [view],0
@@ -3688,61 +3875,64 @@ render:
   call XftDrawString32
   mov rsp,[stack_save]
 .flush:
-  ; Unicode glyph ink can extend outside a cell. Repaint all padding on
-  ; every frame, *after* text/cursor drawing, so it never gets damaged.
+  ; Clip Unicode glyph overspill along window margins with one batched
+  ; XRender fill instead of up to four separate XftDrawRect requests.
+  mov dword [border_rect_count],0
+  lea rbx,[border_rects]
+  mov word [rbx+XRectangle.x],0
+  mov word [rbx+XRectangle.y],0
+  mov eax,[width]
+  mov [rbx+XRectangle.width],ax
+  mov word [rbx+XRectangle.height],PAD
+  mov dword [border_rect_count],1
+  ; left edge below the top strip
+  mov eax,[height]
+  sub eax,PAD
+  jle .border_right
+  mov word [rbx+8+XRectangle.x],0
+  mov word [rbx+8+XRectangle.y],PAD
+  mov word [rbx+8+XRectangle.width],PAD
+  mov [rbx+8+XRectangle.height],ax
+  inc dword [border_rect_count]
+.border_right:
+  mov eax,[cols]
+  imul eax,[cell_w]
+  add eax,PAD
+  mov edx,[width]
+  sub edx,eax
+  jle .border_bottom
+  mov ecx,[height]
+  sub ecx,PAD
+  jle .border_bottom
+  mov r8d,[border_rect_count]
+  lea r9,[rbx+r8*8]
+  mov [r9+XRectangle.x],ax
+  mov word [r9+XRectangle.y],PAD
+  mov [r9+XRectangle.width],dx
+  mov [r9+XRectangle.height],cx
+  inc dword [border_rect_count]
+.border_bottom:
+  mov eax,[rows]
+  imul eax,[cell_h]
+  add eax,PAD
+  mov edx,[height]
+  sub edx,eax
+  jle .border_done
+  mov r8d,[border_rect_count]
+  lea r9,[rbx+r8*8]
+  mov word [r9+XRectangle.x],0
+  mov [r9+XRectangle.y],ax
+  mov ecx,[width]
+  mov [r9+XRectangle.width],cx
+  mov [r9+XRectangle.height],dx
+  inc dword [border_rect_count]
+.border_done:
   xor edi,edi
   call ensure_color
-  mov [border_color],rax
-  ; top edge
-  mov rdi,[draw]
-  mov rsi,[border_color]
-  xor edx,edx
-  xor ecx,ecx
-  mov r8d,[width]
-  mov r9d,PAD
-  ccall XftDrawRect
-  ; left edge
-  mov rdi,[draw]
-  mov rsi,[border_color]
-  xor edx,edx
-  mov ecx,PAD
-  mov r8d,PAD
-  mov r9d,[height]
-  sub r9d,PAD
-  jle .border_right
-  ccall XftDrawRect
-.border_right:
-  ; All slack pixels to the right of the last complete column.
-  mov ebx,[cols]
-  imul ebx,[cell_w]
-  add ebx,PAD
-  cmp ebx,[width]
-  jge .border_bottom
-  mov rdi,[draw]
-  mov rsi,[border_color]
-  mov edx,ebx
-  mov ecx,PAD
-  mov r8d,[width]
-  sub r8d,ebx
-  mov r9d,[height]
-  sub r9d,PAD
-  jle .border_bottom
-  ccall XftDrawRect
-.border_bottom:
-  mov ebx,[rows]
-  imul ebx,[cell_h]
-  add ebx,PAD
-  cmp ebx,[height]
-  jge .border_done
-  mov rdi,[draw]
-  mov rsi,[border_color]
-  xor edx,edx
-  mov ecx,ebx
-  mov r8d,[width]
-  mov r9d,[height]
-  sub r9d,ebx
-  ccall XftDrawRect
-.border_done:
+  mov rdi,rax
+  lea rsi,[border_rects]
+  mov edx,[border_rect_count]
+  call fill_rectangles
   mov rdi,[dpy]
   ccall XFlush
   pop r15
@@ -3784,6 +3974,15 @@ drain_x_events:
   lea rsi,[event]
   ccall XNextEvent
   mov eax,dword [event]
+  mov edx,[randr_event_base]
+  test edx,edx
+  js .dispatch
+  cmp eax,edx                  ; RRScreenChangeNotify
+  je .randr_change
+  inc edx
+  cmp eax,edx                  ; RRNotify (CRTC/output changes)
+  je .randr_change
+.dispatch:
   cmp eax,KeyPress
   je .key
   cmp eax,Expose
@@ -3802,6 +4001,9 @@ drain_x_events:
   je .selection_notify
   cmp eax,ClientMessage
   je .client
+  jmp .loop
+.randr_change:
+  or byte [refresh_pending],2
   jmp .loop
 .key:
   call handle_key
@@ -3838,6 +4040,8 @@ drain_x_events:
   ret
 
 handle_resize:
+  ; A move to another monitor may change refresh without changing size.
+  or byte [refresh_pending],1
   mov eax,dword [event+XConfigure.width]
   cmp eax,[width]
   jne .different
@@ -4879,6 +5083,13 @@ section '.bss' writeable align 4096
   width_metrics rb XGLYPHINFO_BYTES             ; XGlyphInfo (ASCII advance)
   glyph_clip rb XRECTANGLE_BYTES                 ; XRectangle for Unicode ink
   border_color rq 1
+  bg_rect_count rd 1
+  bg_last_row rd 1
+  border_rect_count rd 1
+  paint_cursor rb 1
+  align 8
+  bg_rects rb MAXROW*XRECTANGLE_BYTES
+  border_rects rb 4*XRECTANGLE_BYTES
   fallback_fonts rq 16
   fallback_next rd 1
   fallback_pattern rb 96
@@ -4886,6 +5097,7 @@ section '.bss' writeable align 4096
   font_worker_status rd 1
   unicode_font_tmp rq 1
   draw rq 1
+  draw_picture rq 1
   gc rq 1
   clipboard rq 1
   utf8_atom rq 1
@@ -4955,6 +5167,7 @@ section '.bss' writeable align 4096
   glyph_width rd 1
   paint_y rd 1
   run_len rd 1
+  run_glyph_offset rd 1
   parse_state rd 1
   utf_need rd 1
   utf_code rd 1
@@ -4976,6 +5189,27 @@ section '.bss' writeable align 4096
   paste_offset rd 1
   childpid rd 1
   xfd rd 1
+  randr_event_base rd 1
+  refresh_pending rb 1
+  randr_legacy rb 1
+  randr_cache_valid rb 1
+  align 8
+  randr_display rq 1
+  randr_root rq 1
+  randr_child rq 1
+  randr_error_base rd 1
+  randr_major rd 1
+  randr_minor rd 1
+  randr_cache_count rd 1
+  randr_win_x rd 1
+  randr_win_y rd 1
+  align 8
+  randr_crtcs rb XRR_CRTC_CAP * XRR_CACHE_BYTES
+  align 8
+  frame_interval_ns rq 1
+  next_frame_ns rq 1
+  frame_now rq 2                   ; struct timespec
+  frame_wait rq 2                  ; ppoll relative timeout
   key_state rd 1
   keysym rq 1
   clip_len rd 1
