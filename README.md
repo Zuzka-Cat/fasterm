@@ -22,7 +22,6 @@ sudo make install                  # installs to /usr/local/bin
 | `fastst-hotkey` | Resident Ctrl+Alt+Return shortcut listener |
 
 There are no prebuilt benchmark or compatibility binaries in the default build.
-The old experimental `fastst-trigger` is no longer built or installed.
 
 ### Install options
 
@@ -57,7 +56,7 @@ For the fast preconnected path, start the server **once** in your X11 session:
 fastst --server >/dev/null 2>&1 &
 fastst-launch
 fastst-launch -e htop
-fastst-hotkey &               # optional; grabs Ctrl+Alt+Return
+fastst-hotkey &               # optional; grabs Ctrl+Return
 ```
 
 To start automatically with `startx`, add `fastst --server &` and, optionally,
