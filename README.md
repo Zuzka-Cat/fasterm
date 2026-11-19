@@ -3,6 +3,25 @@
 A small Linux x86-64 terminal written in FASM assembly. Uses X11/Xft, a PTY,
 UTF-8, ANSI/256-color/24-bit RGB, scrollback, buffered paste, and an alternate screen.
 
+## Assembly source layout
+
+The sources target **classic FASM 1.73**, `format ELF64` and the Linux
+**System V AMD64 ABI**. The project-local includes are part of the source tree:
+
+- `include/protocol.inc` — v3 launch-request and abstract socket wire layouts,
+  shared by the terminal, launcher, and hotkey daemon.
+- `include/sysv64.inc` — the register-argument `ccall` alignment wrapper and
+  Linux `pollfd`, `winsize`, `ucred`, and glibc `passwd` offsets.
+- `include/x11.inc` — LP64 Xlib event, Xft and XRender fields and KeySyms.
+- `include/cell.inc` — fixed eight-byte screen-cell and style bit layout.
+
+These layout files use **native FASM `struc`, `virtual at 0`, and `=`**; their
+virtual declarations emit no storage. `PROC32.INC`/32-bit `stdcall` and
+`cinvoke` conventions are not suitable for this 64-bit code. Calls requiring
+stack-passed arguments deliberately retain their explicit ABI sequences.
+FASM's current working directory should be the project root (`make` already
+assumes this). See `REFACTORING.md` for changes and verification notes.
+
 ## Build and install
 
 Install FASM, GCC, libX11, Xft, Fontconfig and libutil (on Arch:

@@ -5,6 +5,9 @@
 ; This intentionally uses the server's environment/cwd, not caller-specific ones.
 ; Build: fasm fasterm-hotkey.asm fasterm-hotkey.o && cc -no-pie -s -o fasterm-hotkey fasterm-hotkey.o -lX11
 format ELF64
+include 'include/protocol.inc'
+include 'include/sysv64.inc'
+include 'include/x11.inc'
 public main
 extrn XOpenDisplay
 extrn XDefaultScreen
@@ -21,23 +24,11 @@ extrn geteuid
 extrn getenv
 extrn snprintf
 
-macro ccall function {
-  push rbp
-  mov rbp,rsp
-  and rsp,-16
-  call function
-  mov rsp,rbp
-  pop rbp
-}
-SOCK_SEQPACKET_CLOEXEC = 80005h
-MSG_NOSIGNAL = 4000h
-PRELOAD_MAGIC = 334d5246h
-KeyPress = 2
 section '.text' executable
 main:
   push rbp
   mov rbp,rsp
-  mov word [sockaddr],1
+  mov word [sockaddr+SocketAddr.family],AF_UNIX
   lea rdi,[display_name]
   ccall getenv
   test rax,rax
@@ -47,8 +38,8 @@ main:
   mov [display_val],rax
   ccall geteuid
   mov ecx,eax
-  lea rdi,[sockaddr+3]
-  mov esi,96
+  lea rdi,[sockaddr+SocketAddr.name]
+  mov esi,SOCKET_NAME_CAP
   lea rdx,[sock_pattern]
   mov r8,[display_val]
   xor eax,eax
@@ -65,7 +56,7 @@ main:
   ccall XRootWindow
   mov [root],rax
   mov rdi,[dpy]
-  mov esi,0ff0dh               ; XK_Return
+  mov esi,XK_Return              ; X11 Return KeySym
   ccall XKeysymToKeycode
   test eax,eax
   jz .fail
@@ -101,7 +92,7 @@ main:
   ccall XNextEvent
   cmp dword [event],KeyPress
   jne .wait
-  mov eax,dword [event+56]     ; XKeyEvent.time in milliseconds
+  mov eax,dword [event+XKey.time]     ; XKeyEvent.time in milliseconds
   mov edx,eax
   sub eax,[last_press]
   cmp eax,125
@@ -115,7 +106,7 @@ main:
 .send:
   mov edi,[client_fd]
   lea rsi,[instant_request]
-  mov edx,16
+  mov edx,PRELOAD_HEADER_BYTES
   mov ecx,MSG_NOSIGNAL
   ccall send
   mov edi,[client_fd]
@@ -129,7 +120,7 @@ main:
   leave
   ret
 connect_worker:
-  mov edi,1
+  mov edi,AF_UNIX
   mov esi,SOCK_SEQPACKET_CLOEXEC
   xor edx,edx
   ccall socket
@@ -138,7 +129,7 @@ connect_worker:
   mov [client_fd],eax
   mov edi,eax
   lea rsi,[sockaddr]
-  mov edx,110
+  mov edx,SOCKET_ADDR_BYTES
   ccall connect
   test eax,eax
   jns .good
@@ -154,13 +145,14 @@ sock_pattern db 'fasterm-v3:%u:%s',0
 display_name db 'DISPLAY',0
 empty db 0
 ; Ctrl+Alt+Return, including CapsLock / NumLock combinations.
-modifiers dd 12,14,28,30
-instant_request dd PRELOAD_MAGIC,0,-1,16
+modifiers dd ControlMask+Mod1Mask, ControlMask+Mod1Mask+LockMask
+          dd ControlMask+Mod1Mask+Mod2Mask, ControlMask+Mod1Mask+LockMask+Mod2Mask
+instant_request dd PRELOAD_MAGIC,0,-1,PRELOAD_HEADER_BYTES
 client_fd dd -1
 section '.bss' writeable align 16
-sockaddr rb 110
+sockaddr rb SOCKET_ADDR_BYTES
 align 16
-event rb 192
+event rb XEVENT_BYTES
 dpy rq 1
 root rq 1
 display_val rq 1

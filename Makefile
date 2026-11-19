@@ -17,12 +17,14 @@ TERM_LDFLAGS ?= -no-pie -Wl,-z,relro -Wl,-z,now -Wl,--build-id=none -Wl,-z,nosep
 TERM_LIBS    ?= -lX11 -l:libXft.so.2 -l:libfontconfig.so.1 -lutil -pthread
 
 PROGRAMS = fasterm fasterm-launch fasterm-hotkey
+# FASM includes are source dependencies, not merely text substituted at build time.
+FASM_INCLUDES := $(wildcard include/*.inc)
 
 .PHONY: all install uninstall clean check check-server start stop status logs restart takeover update dev check-services
 
 all: $(PROGRAMS)
 
-%.o: %.asm
+%.o: %.asm $(FASM_INCLUDES)
 	$(FASM) $< $@
 
 fasterm: fasterm.o

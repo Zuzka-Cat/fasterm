@@ -4,19 +4,24 @@
 ;        fasterm-launch [-e command args...]
 ; The request is accepted only from the same Unix uid via SO_PEERCRED.
 format ELF64
+include 'include/protocol.inc'
 public _start
 
-PRELOAD_PACKET = 32768
-PRELOAD_MAGIC = 334d5246h
-SOCK_SEQPACKET_CLOEXEC = 80005h
-MSG_NOSIGNAL = 4000h
+; Linux x86-64 syscall numbers (this launcher deliberately does not use libc).
+SYS_WRITE   = 1
+SYS_SOCKET  = 41
+SYS_CONNECT = 42
+SYS_SENDTO  = 44
+SYS_EXIT    = 60
+SYS_GETCWD  = 79
+SYS_GETEUID = 107
 
 section '.text' executable
 _start:
   xor ebp,ebp
   mov r13,[rsp]                   ; argc (including our executable)
   lea r14,[rsp+8]                 ; argv
-  cmp r13,33
+  cmp r13,PRELOAD_MAXARGS+1
   ja error_exit
   lea r15,[r14+r13*8+8]          ; envp after argv NULL
   mov [env_start],r15
@@ -33,13 +38,13 @@ _start:
 .found_display:
   lea r12,[rax+8]
 .env_done:
-  mov word [sockaddr],1          ; Linux AF_UNIX, abstract name
-  lea rdi,[sockaddr+3]
+  mov word [sockaddr+SocketAddr.family],AF_UNIX ; Linux abstract socket
+  lea rdi,[sockaddr+SocketAddr.name]
   lea rsi,[sock_prefix]
   mov ecx,sock_prefix_len
   rep movsb
-  ; Render getuid() as ASCII decimal, identical to server's snprintf %u.
-  mov eax,107                    ; SYS_geteuid
+  ; Render geteuid() as ASCII decimal, identical to server's snprintf %u.
+  mov eax,SYS_GETEUID
   syscall
   mov r9d,10
   lea rsi,[digits+12]
@@ -60,7 +65,7 @@ _start:
   test r12,r12
   jz .no_display
   ; Server reserves 96 bytes for entire abstract name, including NUL.
-  lea r11,[sockaddr+3+95]
+  lea r11,[sockaddr+SocketAddr.name+SOCKET_NAME_CAP-1]
 .copy_display:
   cmp rdi,r11
   jae .no_display
@@ -72,19 +77,19 @@ _start:
   inc rdi
   jmp .copy_display
 .no_display:
-  mov dword [packet],PRELOAD_MAGIC
+  mov dword [packet+Request.magic],PRELOAD_MAGIC
   mov rax,r13
   dec eax
-  mov dword [packet+4],eax
+  mov dword [packet+Request.argc],eax
   ; cwd is capped at 1024 bytes; empty if getcwd fails.
-  mov eax,79                    ; SYS_getcwd
-  lea rdi,[packet+16]
-  mov esi,1024
+  mov eax,SYS_GETCWD
+  lea rdi,[packet+Request.cwd]
+  mov esi,PRELOAD_CWD_BYTES
   syscall
   test rax,rax
   jle error_exit
 .cwd_done:
-  lea rdi,[packet+1040]
+  lea rdi,[packet+PRELOAD_FIXED_BYTES]
   lea r11,[packet+PRELOAD_PACKET]
   lea r14,[r14+8]                ; argv[1] onward
   mov r15,r13
@@ -107,12 +112,12 @@ _start:
   jmp .next_arg
 .copy_environment:
   mov r14,[env_start]
-  mov dword [packet+8],0
+  mov dword [packet+Request.envc],0
 .next_env:
   mov rsi,[r14]
   test rsi,rsi
   jz .connect
-  cmp dword [packet+8],255
+  cmp dword [packet+Request.envc],PRELOAD_MAXENVS
   jae error_exit
 .copy_env_byte:
   cmp rdi,r11
@@ -124,32 +129,32 @@ _start:
   test al,al
   jnz .copy_env_byte
   add r14,8
-  inc dword [packet+8]
+  inc dword [packet+Request.envc]
   jmp .next_env
 .connect:
-  ; Header offset 12 carries the exact (bounded) request length.
+  ; Request.length carries the exact (bounded) request size.
   lea rax,[packet]
   sub rdi,rax
-  mov dword [packet+12],edi
+  mov dword [packet+Request.length],edi
   mov r13d,edi
-  mov eax,41                    ; SYS_socket(AF_UNIX, SOCK_STREAM|CLOEXEC, 0)
-  mov edi,1
+  mov eax,SYS_SOCKET             ; SOCK_SEQPACKET|CLOEXEC
+  mov edi,AF_UNIX
   mov esi,SOCK_SEQPACKET_CLOEXEC
   xor edx,edx
   syscall
   test rax,rax
   js error_exit
   mov ebx,eax                    ; fd
-  mov eax,42                    ; SYS_connect
+  mov eax,SYS_CONNECT
   mov edi,ebx
   lea rsi,[sockaddr]
-  mov edx,110
+  mov edx,SOCKET_ADDR_BYTES
   syscall
   test rax,rax
   js error_exit
   lea r12,[packet]
 .send:
-  mov eax,44                    ; SYS_sendto with MSG_NOSIGNAL
+  mov eax,SYS_SENDTO             ; MSG_NOSIGNAL
   mov edi,ebx
   mov rsi,r12
   mov edx,r13d
@@ -162,16 +167,16 @@ _start:
   add r12,rax
   sub r13,rax
   jnz .send
-  mov eax,60                    ; SYS_exit(0)
+  mov eax,SYS_EXIT
   xor edi,edi
   syscall
 error_exit:
-  mov eax,1                     ; SYS_write(stderr,...)
+  mov eax,SYS_WRITE
   mov edi,2
   lea rsi,[error_message]
   mov edx,err_len
   syscall
-  mov eax,60                    ; SYS_exit(1)
+  mov eax,SYS_EXIT
   mov edi,1
   syscall
 
@@ -182,7 +187,7 @@ error_message db 'fasterm-launch: no ready fasterm --server, or invalid request'
 err_len = $ - error_message
 
 section '.bss' writeable align 16
-sockaddr rb 110
+sockaddr rb SOCKET_ADDR_BYTES
 align 16
 packet rb PRELOAD_PACKET
 digits rb 16

@@ -7,6 +7,10 @@
 ;   SSE4.1 ASCII writer, dirty-row drawing, nonblocking PTY batching.
 ;
 format ELF64
+include 'include/protocol.inc'
+include 'include/sysv64.inc'
+include 'include/x11.inc'
+include 'include/cell.inc'
 public main
 extrn XOpenDisplay
 extrn XDefaultScreen
@@ -96,68 +100,36 @@ extrn fprintf
 extrn stderr
 extrn usleep
 
-; ABI-safe compact call wrapper: preserve RBP, maintain 16-byte stack alignment.
-; This is shorter and avoids the extra 16-byte temporary stack allocation.
-macro ccall function {
-  push rbp
-  mov rbp,rsp
-  and rsp,-16
-  call function
-  mov rsp,rbp
-  pop rbp
-}
-
 ; All screen cells are {uint32 codepoint, uint32 style}.
 ; Style: fg index bits 0..11, bg index bits 12..23, and bold, inverse,
-; underline and wide-cell flags in bits 24..27. The palette keeps the 256
+; underline and wide-cell flags in bits 24..27; italic uses bit 28. The palette keeps the 256
 ; xterm entries alongside up to 3840 exact RGB colors per terminal session.
 MAXCOL = 256
 MAXROW = 128
+DEFAULT_COLS = 80
+DEFAULT_ROWS = 24
 RBITS  = 11
+COLBITS = 8                  ; 256 columns per stored row
 RING   = 2048
 RMASK  = RING-1
-ROWB   = 2048             ; MAXCOL*8
+ROWB   = MAXCOL*CELL_BYTES  ; 2048 bytes per row; ring stride is fixed
+PTY_READ_BYTES = 32768        ; independent of preconnected packet capacity
 CLIPCAP = 131584          ; X11 selection transfer bound; avoid XChangeProperty BadLength
 PAD    = 3
-POLLIN  = 1
+if ROWB <> 2048 | MAXCOL <> (1 shl COLBITS)
+  display 'Terminal ring and selection-address stride changed',13,10
+  err
+end if
 O_NONBLOCK = 2048
 F_GETFL = 3
 F_SETFL = 4
 TIOCSWINSZ = 5414h
 ; Optional preconnected launch service: Linux abstract AF_UNIX, AF_UNIX=1.
-SOCK_SEQPACKET_CLOEXEC = 80005h
-SOCK_CLOEXEC = 80000h
 SOL_SOCKET = 1
 SO_PEERCRED = 17
-MSG_WAITALL = 100h
-MSG_NOSIGNAL = 4000h
 SIGCHLD = 17
 SIGTERM = 15
 PR_SET_PDEATHSIG = 1
-PRELOAD_MAGIC = 334d5246h     ; 'FRM3', seqpacket protocol v3
-PRELOAD_PACKET = 32768
-PRELOAD_MAXARGS = 32
-
-; X11 event types and masks
-KeyPress = 2
-ButtonPress = 4
-ButtonRelease = 5
-MotionNotify = 6
-Expose = 12
-DestroyNotify = 17
-ConfigureNotify = 22
-SelectionRequest = 30
-SelectionNotify = 31
-ClientMessage = 33
-KeyPressMask = 1
-ButtonPressMask = 4
-ButtonReleaseMask = 8
-PointerMotionMask = 64
-ExposureMask = 32768
-StructureNotifyMask = 131072
-ShiftMask = 1
-ControlMask = 4
-Mod1Mask = 8
 
 section '.text' executable
 
@@ -270,32 +242,32 @@ main:
   mov ecx,1
   lea r8,[width_metrics]
   ccall XftTextExtents32
-  movsx eax,word [width_metrics+8]   ; XGlyphInfo.xOff
+  movsx eax,word [width_metrics+XGlyphInfo.xOff]
   test eax,eax
   jg .cw_ok
   mov rdx,[font]
-  mov eax,[rdx+12]
+  mov eax,[rdx+XftFont.max_advance_width]
   test eax,eax
   jg .cw_ok
   mov eax,8
 .cw_ok:
   mov [cell_w],eax
   mov rax,[font]
-  mov ecx,[rax]                ; ascent
+  mov ecx,[rax+XftFont.ascent]
   mov [ascent],ecx
-  add ecx,[rax+4]              ; descent
+  add ecx,[rax+XftFont.descent]
   add ecx,2
   mov [cell_h],ecx
 
   ; Default 80x24, actual dimensions via ConfigureNotify.
-  mov dword [cols],80
-  mov dword [rows],24
+  mov dword [cols],DEFAULT_COLS
+  mov dword [rows],DEFAULT_ROWS
   mov eax,[cell_w]
-  imul eax,80
+  imul eax,DEFAULT_COLS
   add eax,PAD*2
   mov [width],eax
   mov eax,[cell_h]
-  imul eax,24
+  imul eax,DEFAULT_ROWS
   add eax,PAD*2
   mov [height],eax
 
@@ -452,11 +424,11 @@ main:
   ccall XConnectionNumber
   mov [xfd],eax
   mov eax,[ptyfd]
-  mov dword [pollfds],eax
-  mov word [pollfds+4],POLLIN
+  mov dword [pollfds+PollFd.fd],eax
+  mov word [pollfds+PollFd.events],POLLIN
   mov eax,[xfd]
-  mov dword [pollfds+8],eax
-  mov word [pollfds+12],POLLIN
+  mov dword [pollfds+POLLFD_BYTES+PollFd.fd],eax
+  mov word [pollfds+POLLFD_BYTES+PollFd.events],POLLIN
 
 .event_loop:
   call drain_x_events
@@ -472,14 +444,14 @@ main:
   test eax,eax
   js .event_loop
   ; Resume buffered input whenever the PTY becomes writable.
-  test word [pollfds+6],4         ; POLLOUT
+  test word [pollfds+PollFd.revents],POLLOUT
   jz .no_write
   call pty_flush
 .no_write:
   ; POLLIN can arrive together with POLLHUP; drain the data before exit.
-  test word [pollfds+6],POLLIN
+  test word [pollfds+PollFd.revents],POLLIN
   jnz .read_pty
-  test word [pollfds+6],8+16+32
+  test word [pollfds+PollFd.revents],POLLERR+POLLHUP+POLLNVAL
   jnz .quit
   jmp .event_loop
 .read_pty:
@@ -488,7 +460,7 @@ main:
 .read_more:
   mov edi,[ptyfd]
   lea rsi,[iobuf]
-  mov edx,32768
+  mov edx,PTY_READ_BYTES
   ccall read
   test rax,rax
   jle .read_done
@@ -503,7 +475,7 @@ main:
   jz .quit
   ; EAGAIN/EINTR may be retried, but Linux PTYs often return EIO
   ; on a dead child while POLLHUP is asserted.
-  test word [pollfds+6],8+16+32
+  test word [pollfds+PollFd.revents],POLLERR+POLLHUP+POLLNVAL
   jnz .quit
   jmp .event_loop
 .quit:
@@ -545,7 +517,7 @@ font_match_worker:
 ; Linux abstract Unix socket keyed by uid + DISPLAY.  This avoids filesystem
 ; races or stale socket paths; SO_PEERCRED rejects other users.
 preload_socket_addr:
-  mov word [server_addr],1
+  mov word [server_addr+SocketAddr.family],AF_UNIX
   lea rdi,[display_env]
   ccall getenv
   test rax,rax
@@ -555,8 +527,8 @@ preload_socket_addr:
   mov [tmp_display],rax
   ccall geteuid
   mov [server_uid],eax
-  lea rdi,[server_addr+3]
-  mov esi,96
+  lea rdi,[server_addr+SocketAddr.name]
+  mov esi,SOCKET_NAME_CAP
   lea rdx,[sock_pattern]
   mov ecx,[server_uid]
   mov r8,[tmp_display]
@@ -566,7 +538,7 @@ preload_socket_addr:
   ret
 
 preload_open_socket:
-  mov edi,1
+  mov edi,AF_UNIX
   mov esi,SOCK_SEQPACKET_CLOEXEC
   xor edx,edx
   ccall socket
@@ -585,11 +557,11 @@ preload_stop_server:
   mov [server_sock],eax
   mov edi,eax
   lea rsi,[server_addr]
-  mov edx,110
+  mov edx,SOCKET_ADDR_BYTES
   ccall connect
   test eax,eax
   js .close_fail
-  mov dword [server_credlen],12
+  mov dword [server_credlen],UCRED_BYTES
   mov edi,[server_sock]
   mov esi,SOL_SOCKET
   mov edx,SO_PEERCRED
@@ -598,12 +570,12 @@ preload_stop_server:
   ccall getsockopt
   test eax,eax
   jnz .close_fail
-  cmp dword [server_credlen],12
+  cmp dword [server_credlen],UCRED_BYTES
   jne .close_fail
-  mov eax,dword [server_creds+4]
+  mov eax,dword [server_creds+UCred.uid]
   cmp eax,[server_uid]
   jne .close_fail
-  mov edi,dword [server_creds] ; listening server's PID
+  mov edi,dword [server_creds+UCred.pid] ; listening server's PID
   test edi,edi
   jle .close_fail
   mov esi,SIGTERM
@@ -631,27 +603,27 @@ preload_client:
   mov [server_sock],eax
   mov edi,eax
   lea rsi,[server_addr]
-  mov edx,110
+  mov edx,SOCKET_ADDR_BYTES
   ccall connect
   test eax,eax
   js .fail_socket
   ; Bounded variable-length request: header / cwd / NUL-separated argv.
-  mov dword [request_buffer],PRELOAD_MAGIC
+  mov dword [request_buffer+Request.magic],PRELOAD_MAGIC
   mov rax,[cmd_argv]
   mov eax,[cmd_argc]
   sub eax,2
   cmp eax,PRELOAD_MAXARGS
   ja .fail_socket
-  mov dword [request_buffer+4],eax
-  lea rdi,[request_buffer+16]
-  mov esi,1024
+  mov dword [request_buffer+Request.argc],eax
+  lea rdi,[request_buffer+Request.cwd]
+  mov esi,PRELOAD_CWD_BYTES
   ccall getcwd
   test rax,rax
   jz .fail_socket
 .cwd_ok:
-  lea r12,[request_buffer+1040]
+  lea r12,[request_buffer+PRELOAD_FIXED_BYTES]
   lea r13,[request_buffer+PRELOAD_PACKET]
-  mov eax,dword [request_buffer+4]
+  mov eax,dword [request_buffer+Request.argc]
   test eax,eax
   jz .copy_environment
   mov [server_remaining],eax
@@ -680,12 +652,12 @@ preload_client:
   ; The fixed-size packet rejects oversized environments rather than
   ; silently running the user's shell with incorrect settings.
   mov rbx,[environ]
-  mov dword [request_buffer+8],0
+  mov dword [request_buffer+Request.envc],0
 .env_loop:
   mov rax,[rbx]
   test rax,rax
   jz .send
-  cmp dword [request_buffer+8],255
+  cmp dword [request_buffer+Request.envc],PRELOAD_MAXENVS
   jae .fail_socket
   mov r14,rax
   mov rdi,rax
@@ -700,14 +672,14 @@ preload_client:
   ccall memcpy
   add r12,r15
   add rbx,8
-  inc dword [request_buffer+8]
+  inc dword [request_buffer+Request.envc]
   jmp .env_loop
 .send:
   ; Send only the populated bytes (usually 2-8 KiB), not 32 KiB of zeros.
   lea rax,[request_buffer]
   mov r13,r12
   sub r13,rax
-  mov dword [request_buffer+12],r13d
+  mov dword [request_buffer+Request.length],r13d
   mov r12,rax
 .send_loop:
   mov edi,[server_sock]
@@ -738,12 +710,12 @@ preload_server:
   mov [server_sock],eax
   mov edi,eax
   lea rsi,[server_addr]
-  mov edx,110
+  mov edx,SOCKET_ADDR_BYTES
   ccall bind
   test eax,eax
   js .fail
   mov edi,[server_sock]
-  mov esi,32
+  mov esi,PRELOAD_MAXARGS
   ccall listen
   test eax,eax
   js .fail
@@ -761,15 +733,17 @@ preload_server:
   call preload_spawn_worker
 .loop:
   mov eax,[server_pipe]
-  mov dword [server_pollfd],eax
-  mov word [server_pollfd+4],POLLIN
+  mov dword [server_pollfd+PollFd.fd],eax
+  mov word [server_pollfd+PollFd.events],POLLIN
   lea rdi,[server_pollfd]
   mov esi,1
   mov edx,-1
   ccall poll
   test eax,eax
   jle .loop
-  test word [server_pollfd+4],POLLIN
+  ; Preserve the original test of .events (not .revents) in this
+  ; readability-only pass; see REFACTORING.md for the deferred bug candidate.
+  test word [server_pollfd+PollFd.events],POLLIN
   jz .loop
   mov edi,[server_pipe]
   lea rsi,[server_events]
@@ -822,7 +796,7 @@ preload_accept_request:
   js .wait
   mov [server_client_sock],eax
   ; Linux SO_PEERCRED: {pid_t pid, uid_t uid, gid_t gid}.
-  mov dword [server_credlen],12
+  mov dword [server_credlen],UCRED_BYTES
   mov edi,eax
   mov esi,SOL_SOCKET
   mov edx,SO_PEERCRED
@@ -831,7 +805,7 @@ preload_accept_request:
   ccall getsockopt
   test eax,eax
   jnz .reject
-  mov eax,dword [server_creds+4]
+  mov eax,dword [server_creds+UCred.uid]
   cmp eax,[server_uid]
   jne .reject
   ; SOCK_SEQPACKET delivers the bounded request atomically in ONE recv.
@@ -839,44 +813,44 @@ preload_accept_request:
   mov edi,[server_client_sock]
   lea rsi,[request_buffer]
   mov edx,PRELOAD_PACKET
-  mov ecx,20h                  ; MSG_TRUNC (Linux)
+  mov ecx,MSG_TRUNC           ; return full size of truncated datagram
   ccall recv
-  cmp eax,16
+  cmp eax,PRELOAD_HEADER_BYTES
   jl .reject
   cmp eax,PRELOAD_PACKET
   jg .reject
-  cmp dword [request_buffer],PRELOAD_MAGIC
+  cmp dword [request_buffer+Request.magic],PRELOAD_MAGIC
   jne .reject
-  cmp eax,dword [request_buffer+12]
+  cmp eax,dword [request_buffer+Request.length]
   jne .reject
   ; 16-byte trigger: server's original shell, cwd and environment.
   ; No argument/environment serialization or cwd round trip on this path.
-  cmp eax,16
+  cmp eax,PRELOAD_HEADER_BYTES
   jne .full_request
-  cmp dword [request_buffer+4],0
+  cmp dword [request_buffer+Request.argc],0
   jne .reject
-  cmp dword [request_buffer+8],-1
+  cmp dword [request_buffer+Request.envc],-1
   jne .reject
   mov dword [cmd_argc],1
   lea rax,[server_dummy_argv]
   mov [cmd_argv],rax
   jmp .accepted
 .full_request:
-  cmp eax,1040
+  cmp eax,PRELOAD_FIXED_BYTES
   jl .reject
-  mov r14d,dword [request_buffer+4]
+  mov r14d,dword [request_buffer+Request.argc]
   cmp r14d,PRELOAD_MAXARGS
   ja .reject
   ; Never search outside packet even if same-uid client sends bad input.
-  lea rdi,[request_buffer+16]
-  mov esi,1024
+  lea rdi,[request_buffer+Request.cwd]
+  mov esi,PRELOAD_CWD_BYTES
   ccall strnlen
-  cmp eax,1024
+  cmp eax,PRELOAD_CWD_BYTES
   jae .reject
   mov [server_cwd_len],eax
   ; Validate all NUL-terminated args before accepting the request.
-  lea r12,[request_buffer+1040]
-  mov eax,dword [request_buffer+12]
+  lea r12,[request_buffer+PRELOAD_FIXED_BYTES]
+  mov eax,dword [request_buffer+Request.length]
   lea r13,[request_buffer]
   add r13,rax
   mov r15d,r14d
@@ -902,8 +876,8 @@ preload_accept_request:
   jmp .parse_args
 .parse_done:
   mov qword [rbx],0
-  mov r15d,dword [request_buffer+8]
-  cmp r15d,255
+  mov r15d,dword [request_buffer+Request.envc]
+  cmp r15d,PRELOAD_MAXENVS
   ja .reject
   mov [server_env_count],r15d
   lea rbx,[server_env_argv]
@@ -926,7 +900,7 @@ preload_accept_request:
   jmp .parse_env
 .env_done:
   mov qword [rbx],0
-  lea rdi,[request_buffer+16]
+  lea rdi,[request_buffer+Request.cwd]
   cmp byte [rdi],0
   je .no_chdir
   ccall chdir
@@ -973,10 +947,10 @@ preload_accept_request:
   jmp .wait
 
 spawn_shell:
-  mov word [winsize],24
-  mov word [winsize+2],80
-  mov word [winsize+4],0
-  mov word [winsize+6],0
+  mov word [winsize+WinSize.rows],DEFAULT_ROWS
+  mov word [winsize+WinSize.cols],DEFAULT_COLS
+  mov word [winsize+WinSize.xpixels],0
+  mov word [winsize+WinSize.ypixels],0
   lea rdi,[ptyfd]
   xor esi,esi
   xor edx,edx
@@ -1042,7 +1016,7 @@ spawn_shell:
   ccall getpwuid
   test rax,rax
   jz .environment_fallback
-  mov rax,qword [rax+40]
+  mov rax,qword [rax+Passwd.shell]
   test rax,rax
   jz .environment_fallback
   cmp byte [rax],0
@@ -1082,12 +1056,12 @@ rowaddr:
   jnz .alt
   add eax,[head]
   and eax,RMASK
-  shl rax,11
+  shl rax,RBITS
   lea r11,[history]
   add rax,r11
   ret
 .alt:
-  shl rax,11
+  shl rax,RBITS
   lea r11,[alternate]
   add rax,r11
   ret
@@ -1289,25 +1263,25 @@ put_rune:
   sub edi,edx
   cmp edi,[cursor_x]
   jl .insert_done
-  mov r8,[rax+rdi*8]
-  mov [rax+rcx*8],r8
+  mov r8,[rax+rdi*CELL_BYTES]
+  mov [rax+rcx*CELL_BYTES],r8
   dec ecx
   jmp .insert_loop
 .insert_done:
   mov byte [dirty_any],1
 .no_insert:
   mov edx,[cursor_x]
-  lea rdx,[rax+rdx*8]
-  mov [rdx],ebx
+  lea rdx,[rax+rdx*CELL_BYTES]
+  mov [rdx+Cell.codepoint],ebx
   mov eax,[curattr]
-  mov [rdx+4],eax
+  mov [rdx+Cell.style],eax
   mov eax,[glyph_width]
   cmp eax,2
   jne .single
-  mov dword [rdx+8],0
+  mov dword [rdx+CELL_BYTES+Cell.codepoint],0
   mov eax,[curattr]
-  or eax,8000000h               ; trailing-cell marker
-  mov [rdx+12],eax
+  or eax,STYLE_WIDE_TRAIL               ; trailing-cell marker
+  mov [rdx+CELL_BYTES+Cell.style],eax
 .single:
   mov eax,[cursor_y]
   call mark_row
@@ -1753,7 +1727,7 @@ feed_bytes:
   mov eax,[cursor_y]
   call rowaddr
   mov edx,[cursor_x]
-  lea rax,[rax+rdx*8]
+  lea rax,[rax+rdx*CELL_BYTES]
   movdqu [rax],xmm0
   movdqu [rax+16],xmm2
   add dword [cursor_x],4
@@ -2018,8 +1992,8 @@ csi_exec:
 .ic_loop:
   cmp edx,[cursor_x]
   jl .ic_blank
-  mov rax,[r8+rdx*8]
-  mov [r8+rcx*8],rax
+  mov rax,[r8+rdx*CELL_BYTES]
+  mov [r8+rcx*CELL_BYTES],rax
   dec edx
   dec ecx
   jmp .ic_loop
@@ -2030,7 +2004,7 @@ csi_exec:
 .ic_clear:
   test ecx,ecx
   jle .ic_end
-  mov [r8+rdx*8],rax
+  mov [r8+rdx*CELL_BYTES],rax
   inc edx
   dec ecx
   jmp .ic_clear
@@ -2057,8 +2031,8 @@ csi_exec:
   add ecx,ebx
   cmp ecx,[cols]
   jge .dc_blank
-  mov rax,[r8+rcx*8]
-  mov [r8+rdx*8],rax
+  mov rax,[r8+rcx*CELL_BYTES]
+  mov [r8+rdx*CELL_BYTES],rax
   inc edx
   jmp .dc_loop
 .dc_blank:
@@ -2066,7 +2040,7 @@ csi_exec:
 .dc_clear:
   cmp edx,[cols]
   jge .dc_end
-  mov [r8+rdx*8],rax
+  mov [r8+rdx*CELL_BYTES],rax
   inc edx
   jmp .dc_clear
 .dc_end:
@@ -2121,13 +2095,13 @@ csi_exec:
   cmp dword [csi_args],5
   jne .done
   lea rsi,[status_ok]
-  mov edx,4
+  mov edx,status_ok_len
   jmp pty_write
 .identity:
   cmp byte [csi_private],0
   jne .done
   lea rsi,[device_id]
-  mov edx,5
+  mov edx,device_id_len
   jmp pty_write
 
 clamp_cursor:
@@ -2160,7 +2134,7 @@ clear_range:
   mov ebx,ecx
   mov eax,esi
   call rowaddr
-  lea rdi,[rax+rdx*8]
+  lea rdi,[rax+rdx*CELL_BYTES]
   mov ecx,ebx
   sub ecx,edx
   inc ecx
@@ -2304,60 +2278,60 @@ csi_sgr:
   je .extended
   jmp .advance
 .reset:
-  mov dword [curattr],7
+  mov dword [curattr],STYLE_DEFAULT
   jmp .advance
 .bold:
-  or dword [curattr],1000000h
+  or dword [curattr],STYLE_BOLD
   jmp .advance
 .italic:
-  or dword [curattr],10000000h
+  or dword [curattr],STYLE_ITALIC
   jmp .advance
 .no_italic:
-  and dword [curattr],0efffffffh
+  and dword [curattr],not STYLE_ITALIC
   jmp .advance
 .underline:
-  or dword [curattr],4000000h
+  or dword [curattr],STYLE_UNDERLINE
   jmp .advance
 .no_underline:
-  and dword [curattr],0fbffffffh
+  and dword [curattr],not STYLE_UNDERLINE
   jmp .advance
 .normal:
-  and dword [curattr],0feffffffh
+  and dword [curattr],not STYLE_BOLD
   jmp .advance
 .inverse:
-  or dword [curattr],2000000h
+  or dword [curattr],STYLE_INVERSE
   jmp .advance
 .uninverse:
-  and dword [curattr],0fdffffffh
+  and dword [curattr],not STYLE_INVERSE
   jmp .advance
 .fg:
   sub eax,30
-  and dword [curattr],0fffff000h
+  and dword [curattr],not STYLE_INDEX_MASK
   or [curattr],eax
   jmp .advance
 .bg:
   sub eax,40
-  shl eax,12
-  and dword [curattr],0ff000fffh
+  shl eax,STYLE_BG_SHIFT
+  and dword [curattr],not STYLE_BG_MASK
   or [curattr],eax
   jmp .advance
 .bright_fg:
   sub eax,82
-  and dword [curattr],0fffff000h
+  and dword [curattr],not STYLE_INDEX_MASK
   or [curattr],eax
   jmp .advance
 .bright_bg:
   sub eax,92
-  shl eax,12
-  and dword [curattr],0ff000fffh
+  shl eax,STYLE_BG_SHIFT
+  and dword [curattr],not STYLE_BG_MASK
   or [curattr],eax
   jmp .advance
 .fg_default:
-  and dword [curattr],0fffff000h
+  and dword [curattr],not STYLE_INDEX_MASK
   or dword [curattr],7
   jmp .advance
 .bg_default:
-  and dword [curattr],0ff000fffh
+  and dword [curattr],not STYLE_BG_MASK
   jmp .advance
 .extended:
   mov ebx,eax
@@ -2415,12 +2389,12 @@ csi_sgr:
 .ext_set:
   cmp ebx,38
   jne .ext_bg
-  and dword [curattr],0fffff000h
+  and dword [curattr],not STYLE_INDEX_MASK
   or [curattr],eax
   jmp .advance
 .ext_bg:
-  shl eax,12
-  and dword [curattr],0ff000fffh
+  shl eax,STYLE_BG_SHIFT
+  and dword [curattr],not STYLE_BG_MASK
   or [curattr],eax
 .advance:
   inc esi
@@ -2740,11 +2714,11 @@ pty_flush:
 .empty:
   mov qword [pty_used],0
   mov qword [pty_sent],0
-  mov word [pollfds+4],POLLIN
+  mov word [pollfds+PollFd.events],POLLIN
   pop rbx
   ret
 .blocked:
-  mov word [pollfds+4],POLLIN+4   ; POLLOUT
+  mov word [pollfds+PollFd.events],POLLIN+POLLOUT
   pop rbx
   ret
 
@@ -2753,7 +2727,7 @@ pty_flush:
 ; An exhausted RGB palette degrades to the xterm cube without overwriting
 ; colors still referenced by scrollback or the alternate screen.
 color_lookup_rgb:
-  mov edx,256
+  mov edx,PALETTE_RGB_FIRST
 .find:
   cmp edx,[rgb_next]
   jae .insert
@@ -2765,7 +2739,7 @@ color_lookup_rgb:
   mov eax,edx
   ret
 .insert:
-  cmp edx,4096
+  cmp edx,PALETTE_CAP
   jae .full
   mov [rgb_values+rdx*4],edi
   inc dword [rgb_next]
@@ -2807,7 +2781,7 @@ color_lookup_rgb:
 ensure_color:
   push rbx
   mov ebx,edi
-  cmp ebx,4095
+  cmp ebx,PALETTE_CAP-1
   jbe .valid
   mov ebx,7
 .valid:
@@ -2862,17 +2836,17 @@ ensure_color:
   mov ecx,eax
   shr ecx,16
   imul ecx,257
-  mov word [render_color],cx
+  mov word [render_color+XRenderColor.red],cx
   mov ecx,eax
   shr ecx,8
   and ecx,255
   imul ecx,257
-  mov word [render_color+2],cx
+  mov word [render_color+XRenderColor.green],cx
   mov ecx,eax
   and ecx,255
   imul ecx,257
-  mov word [render_color+4],cx
-  mov word [render_color+6],65535
+  mov word [render_color+XRenderColor.blue],cx
+  mov word [render_color+XRenderColor.alpha],65535
   mov rdi,[dpy]
   mov rsi,[visual]
   mov rdx,[cmap]
@@ -2894,17 +2868,17 @@ ensure_color:
 ; edi=attribute. eax=effective fg index, edx=effective bg index.
 cell_colors:
   mov eax,edi
-  and eax,4095
+  and eax,STYLE_INDEX_MASK
   mov edx,edi
-  shr edx,12
-  and edx,4095
-  test edi,1000000h
+  shr edx,STYLE_BG_SHIFT
+  and edx,STYLE_INDEX_MASK
+  test edi,STYLE_BOLD
   jz .no_bold
   cmp eax,8
   jae .no_bold
   add eax,8
 .no_bold:
-  test edi,2000000h
+  test edi,STYLE_INVERSE
   jz .done
   xchg eax,edx
 .done:
@@ -2915,12 +2889,12 @@ cell_colors:
 ; Input EDI=cell style, returns RAX=XftFont*; preserve RBX.
 select_font:
   mov eax,edi
-  and eax,11000000h
+  and eax,STYLE_FONT_MASK
   jz .regular
   push rbx
-  cmp eax,1000000h
+  cmp eax,STYLE_BOLD
   je .bold
-  cmp eax,10000000h
+  cmp eax,STYLE_ITALIC
   je .italic
   lea rbx,[font_bolditalic]
   lea rdx,[font_bolditalic_spec]
@@ -3331,7 +3305,7 @@ render:
 .bg_loop:
   cmp r12d,[cols]
   jge .fg_start
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
   mov ebx,edx
   test ebx,ebx
@@ -3341,7 +3315,7 @@ render:
   inc r12d
   cmp r12d,[cols]
   jge .bg_draw
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
   cmp edx,ebx
   je .bg_find
@@ -3368,10 +3342,10 @@ render:
   cmp byte [selection_active],0
   je .fg_no_selection
   mov eax,[sel_anchor_y]
-  shl eax,8
+  shl eax,COLBITS
   add eax,[sel_anchor_x]
   mov edx,[sel_end_y]
-  shl edx,8
+  shl edx,COLBITS
   add edx,[sel_end_x]
   cmp eax,edx
   jle .fg_sel_sorted
@@ -3419,19 +3393,19 @@ render:
 .fg_loop:
   cmp r12d,[cols]
   jge .underline_start
-  test dword [r14+r12*8+4],8000000h  ; wide rune trailing cell
+  test dword [r14+r12*CELL_BYTES+Cell.style],STYLE_WIDE_TRAIL  ; wide rune trailing cell
   jz .fg_not_dummy
   inc r12d
   jmp .fg_loop
 .fg_not_dummy:
-  mov eax,[r14+r12*8]
+  mov eax,[r14+r12*CELL_BYTES+Cell.codepoint]
   cmp eax,128
   jae .fg_unicode
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
   mov ebx,eax                 ; foreground index
-  mov eax,[r14+r12*8+4]
-  and eax,11000000h           ; group runs by font face as well as color
+  mov eax,[r14+r12*CELL_BYTES+Cell.style]
+  and eax,STYLE_FONT_MASK           ; group runs by font face as well as color
   mov [run_style],eax
   mov r15d,r12d              ; run beginning
   lea r9,[glyphs]
@@ -3439,17 +3413,17 @@ render:
 .fg_find:
   cmp r12d,[cols]
   jge .fg_draw
-  test dword [r14+r12*8+4],8000000h
+  test dword [r14+r12*CELL_BYTES+Cell.style],STYLE_WIDE_TRAIL
   jnz .fg_draw
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   mov eax,edi
-  and eax,11000000h
+  and eax,STYLE_FONT_MASK
   cmp eax,[run_style]
   jne .fg_draw
   call cell_colors
   cmp eax,ebx
   jne .fg_draw
-  mov eax,[r14+r12*8]
+  mov eax,[r14+r12*CELL_BYTES+Cell.codepoint]
   cmp eax,128
   jae .fg_draw
   test eax,eax
@@ -3499,22 +3473,22 @@ render:
 .fg_unicode:
   ; Draw a non-ASCII rune separately at its absolute cell position.
   ; This handles double-width alignment and allows lazy font fallback.
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call cell_colors
   mov ebx,eax
-  mov edi,[r14+r12*8]
+  mov edi,[r14+r12*CELL_BYTES+Cell.codepoint]
   call draw_graphics
   test eax,eax
   jz .u_text
   inc r12d
   jmp .fg_loop
 .u_text:
-  mov edi,[r14+r12*8+4]
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
   call select_font
   mov [unicode_font_tmp],rax
   mov rsi,rax
   mov rdi,[dpy]
-  mov edx,[r14+r12*8]
+  mov edx,[r14+r12*CELL_BYTES+Cell.codepoint]
   ccall XftCharExists
   ; XftCharExists may clobber RDX (a caller-saved argument register).
   ; Search our small fallback-font cache before asking Fontconfig to resolve
@@ -3530,7 +3504,7 @@ render:
   test rsi,rsi
   jz .u_open
   mov rdi,[dpy]
-  mov edx,[r14+r12*8]
+  mov edx,[r14+r12*CELL_BYTES+Cell.codepoint]
   ccall XftCharExists
   test eax,eax
   jnz .u_cache_hit
@@ -3546,7 +3520,7 @@ render:
   lea rdi,[fallback_pattern]
   mov esi,96
   lea rdx,[fallback_format]
-  mov ecx,[r14+r12*8]
+  mov ecx,[r14+r12*CELL_BYTES+Cell.codepoint]
   xor eax,eax
   ccall snprintf
   mov rdi,[dpy]
@@ -3577,20 +3551,20 @@ render:
   mov eax,r12d
   imul eax,[cell_w]
   add eax,PAD
-  mov word [glyph_clip],ax
+  mov word [glyph_clip+XRectangle.x],ax
   mov eax,[paint_y]
-  mov word [glyph_clip+2],ax
+  mov word [glyph_clip+XRectangle.y],ax
   mov eax,[cell_w]
   lea edx,[r12+1]
   cmp edx,[cols]
   jge .clip_single
-  test dword [r14+rdx*8+4],8000000h
+  test dword [r14+rdx*CELL_BYTES+Cell.style],STYLE_WIDE_TRAIL
   jz .clip_single
   add eax,eax
 .clip_single:
-  mov word [glyph_clip+4],ax
+  mov word [glyph_clip+XRectangle.width],ax
   mov eax,[cell_h]
-  mov word [glyph_clip+6],ax
+  mov word [glyph_clip+XRectangle.height],ax
   mov rdi,[draw]
   xor esi,esi
   xor edx,edx
@@ -3607,7 +3581,7 @@ render:
   add ecx,PAD
   mov r8d,[paint_y]
   add r8d,[ascent]
-  lea r9,[r14+r12*8]
+  lea r9,[r14+r12*CELL_BYTES+Cell.codepoint]
   mov [stack_save],rsp
   and rsp,-16
   sub rsp,16
@@ -3625,8 +3599,8 @@ render:
 .ul_loop:
   cmp r12d,[cols]
   jge .row_next
-  mov edi,[r14+r12*8+4]
-  test edi,4000000h
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
+  test edi,STYLE_UNDERLINE
   jz .ul_next
   call cell_colors
   mov ebx,eax
@@ -3635,8 +3609,8 @@ render:
   inc r12d
   cmp r12d,[cols]
   jge .ul_draw
-  mov edi,[r14+r12*8+4]
-  test edi,4000000h
+  mov edi,[r14+r12*CELL_BYTES+Cell.style]
+  test edi,STYLE_UNDERLINE
   jz .ul_draw
   call cell_colors
   cmp eax,ebx
@@ -3675,7 +3649,7 @@ render:
   jae .flush
   call rowaddr
   mov edx,[cursor_x]
-  lea r14,[rax+rdx*8]
+  lea r14,[rax+rdx*CELL_BYTES]
   ; white cursor rectangle
   mov edi,15
   call ensure_color
@@ -3854,7 +3828,7 @@ drain_x_events:
   call handle_selection_notify
   jmp .loop
 .client:
-  mov rax,qword [event+56]
+  mov rax,qword [event+XClientMessage.data_l0]
   cmp rax,[wm_delete]
   jne .loop
   mov edi,0
@@ -3864,16 +3838,16 @@ drain_x_events:
   ret
 
 handle_resize:
-  mov eax,dword [event+56]
+  mov eax,dword [event+XConfigure.width]
   cmp eax,[width]
   jne .different
-  mov eax,dword [event+60]
+  mov eax,dword [event+XConfigure.height]
   cmp eax,[height]
   je .end
 .different:
-  mov eax,dword [event+56]
+  mov eax,dword [event+XConfigure.width]
   mov [width],eax
-  mov eax,dword [event+60]
+  mov eax,dword [event+XConfigure.height]
   mov [height],eax
   mov eax,[width]
   cmp eax,PAD*2
@@ -3946,9 +3920,9 @@ handle_resize:
   mov dword [top],0
   call clamp_cursor
   mov eax,[rows]
-  mov word [winsize],ax
+  mov word [winsize+WinSize.rows],ax
   mov eax,[cols]
-  mov word [winsize+2],ax
+  mov word [winsize+WinSize.cols],ax
   mov edi,[ptyfd]
   mov esi,TIOCSWINSZ
   lea rdx,[winsize]
@@ -3979,7 +3953,7 @@ resize_clear_exposed:
   jle .next_row
   call rowaddr
   mov edx,[resize_old_cols]
-  lea rdi,[rax+rdx*8]
+  lea rdi,[rax+rdx*CELL_BYTES]
   mov eax,[curattr]
   shl rax,32
   rep stosq
@@ -4028,7 +4002,7 @@ handle_key:
   xor r8d,r8d
   ccall XLookupString
   mov ebx,eax
-  mov eax,dword [event+80]
+  mov eax,dword [event+XKey.state]
   mov [key_state],eax
   ; Ctrl+Shift+C/V: primary selection to clipboard/paste.
   and eax,ShiftMask+ControlMask
@@ -4042,33 +4016,33 @@ handle_key:
   je .paste
 .normal:
   mov eax,dword [keysym]
-  cmp eax,0ff55h
+  cmp eax,XK_Page_Up
   je .pageup
-  cmp eax,0ff56h
+  cmp eax,XK_Page_Down
   je .pagedown
-  cmp eax,0ff50h
+  cmp eax,XK_Home
   je .home
-  cmp eax,0ff57h
+  cmp eax,XK_End
   je .end
-  cmp eax,0ff51h
+  cmp eax,XK_Left
   je .left
-  cmp eax,0ff52h
+  cmp eax,XK_Up
   je .up
-  cmp eax,0ff53h
+  cmp eax,XK_Right
   je .right
-  cmp eax,0ff54h
+  cmp eax,XK_Down
   je .down
-  cmp eax,0ffffh
+  cmp eax,XK_Delete
   je .delete
-  cmp eax,0ff63h
+  cmp eax,XK_Insert
   je .insert
-  cmp eax,0ff08h
+  cmp eax,XK_BackSpace
   je .backspace
-  cmp eax,0ff0dh
+  cmp eax,XK_Return
   je .return
-  cmp eax,0ff09h
+  cmp eax,XK_Tab
   je .tab
-  cmp eax,0ff1bh
+  cmp eax,XK_Escape
   je .esc
   cmp ebx,0
   jle .done
@@ -4101,7 +4075,7 @@ handle_key:
   ret
 .send_pageup:
   lea rsi,[seq_pageup]
-  mov edx,4
+  mov edx,seq_pageup_len
   jmp key_escape
  .pagedown:
   cmp byte [altscreen],0
@@ -4115,7 +4089,7 @@ handle_key:
   ret
 .send_pagedown:
   lea rsi,[seq_pagedown]
-  mov edx,4
+  mov edx,seq_pagedown_len
   jmp key_escape
 .home:
   test dword [key_state],ShiftMask
@@ -4125,7 +4099,7 @@ handle_key:
   ret
 .send_home:
   lea rsi,[seq_home]
-  mov edx,3
+  mov edx,seq_home_len
   jmp key_escape
 .end:
   test dword [key_state],ShiftMask
@@ -4135,7 +4109,7 @@ handle_key:
   ret
 .send_end:
   lea rsi,[seq_end]
-  mov edx,3
+  mov edx,seq_end_len
   jmp key_escape
 .left:
   lea rsi,[seq_left]
@@ -4190,15 +4164,15 @@ handle_key:
   mov [arrow_buf+2],al
   lea rsi,[arrow_buf]
 .normal_arrow:
-  mov edx,3
+  mov edx,seq_up_len
   jmp key_escape
 .delete:
   lea rsi,[seq_delete]
-  mov edx,4
+  mov edx,seq_delete_len
   jmp key_escape
 .insert:
   lea rsi,[seq_insert]
-  mov edx,4
+  mov edx,seq_insert_len
   jmp key_escape
 .backspace:
   mov byte [onechar],127
@@ -4225,12 +4199,12 @@ handle_key:
 
 ; Mouse wheel scrolling and basic X10/SGR mouse reporting.
 handle_button_press:
-  mov eax,dword [event+84]         ; XButtonEvent button number
+  mov eax,dword [event+XButton.button]         ; XButtonEvent button number
   cmp eax,4
   jne .not_up
   cmp byte [mouse_mode],0
   je .wheel_up
-  test dword [event+80],ShiftMask
+  test dword [event+XButton.state],ShiftMask
   jnz .wheel_up
   mov edi,64
   mov esi,'M'
@@ -4243,7 +4217,7 @@ handle_button_press:
   jne .not_down
   cmp byte [mouse_mode],0
   je .wheel_down
-  test dword [event+80],ShiftMask
+  test dword [event+XButton.state],ShiftMask
   jnz .wheel_down
   mov edi,65
   mov esi,'M'
@@ -4254,7 +4228,7 @@ handle_button_press:
 .not_down:
   cmp byte [mouse_mode],0
   je .normal_mouse
-  test dword [event+80],ShiftMask
+  test dword [event+XButton.state],ShiftMask
   jnz .normal_mouse
   cmp eax,1
   jne .app_middle
@@ -4296,15 +4270,15 @@ handle_button_press:
 handle_button_release:
   cmp byte [mouse_mode],0
   je .normal_release
-  test dword [event+80],ShiftMask
+  test dword [event+XButton.state],ShiftMask
   jnz .normal_release
-  cmp dword [event+84],1
+  cmp dword [event+XButton.button],1
   jne .done
   mov edi,3
   mov esi,'m'
   jmp mouse_report
 .normal_release:
-  cmp dword [event+84],1
+  cmp dword [event+XButton.button],1
   jne .done
   cmp byte [selecting],0
   je .done
@@ -4319,11 +4293,11 @@ handle_button_release:
   ret
 
 handle_motion:
-  test dword [event+80],256 ; Button1Mask
+  test dword [event+XMotion.state],Button1Mask
   jz .done
   cmp byte [mouse_mode],0
   je .normal_motion
-  test dword [event+80],ShiftMask
+  test dword [event+XMotion.state],ShiftMask
   jnz .normal_motion
   mov edi,32
   mov esi,'M'
@@ -4424,9 +4398,10 @@ append_dec:
   pop rbx
   ret
 
-; coordinates from X event -> edx=col,ecx=row
+; coordinates from XButtonEvent / XMotionEvent -> edx=col,ecx=row
+; Both union members share the x/y offsets used below.
 mouse_cell:
-  mov eax,dword [event+64]
+  mov eax,dword [event+XButton.x]
   sub eax,PAD
   jns .nonnegative_x
   xor eax,eax
@@ -4439,7 +4414,7 @@ mouse_cell:
   dec eax
 .save_x:
   mov r8d,eax
-  mov eax,dword [event+68]
+  mov eax,dword [event+XButton.y]
   sub eax,PAD
   jns .nonnegative_y
   xor eax,eax
@@ -4502,7 +4477,7 @@ copy_selection:
 .trim:
   cmp ebx,r12d
   jl .nextline
-  mov eax,[r14+rbx*8]
+  mov eax,[r14+rbx*CELL_BYTES+Cell.codepoint]
   cmp eax,' '
   ja .characters
   dec ebx
@@ -4516,7 +4491,7 @@ copy_selection:
   lea rax,[clip_buffer+CLIPCAP-5]
   cmp r15,rax
   jae .finish
-  mov edi,[r14+r12*8]
+  mov edi,[r14+r12*CELL_BYTES+Cell.codepoint]
   test edi,edi
   jz .skip_codepoint
   call utf8_append
@@ -4629,15 +4604,15 @@ request_paste:
 
 handle_selection_request:
   ; Copy fields before overwriting XEvent with SelectionNotify.
-  mov rax,qword [event+40]
+  mov rax,qword [event+XSelectionRequest.requestor]
   mov [req_window],rax
-  mov rax,qword [event+48]
+  mov rax,qword [event+XSelectionRequest.selection]
   mov [req_selection],rax
-  mov rax,qword [event+56]
+  mov rax,qword [event+XSelectionRequest.target]
   mov [req_target],rax
-  mov rax,qword [event+64]
+  mov rax,qword [event+XSelectionRequest.property]
   mov [req_property],rax
-  mov rax,qword [event+72]
+  mov rax,qword [event+XSelectionRequest.time]
   mov [req_time],rax
   test qword [req_property],-1
   jnz .has_property
@@ -4692,21 +4667,21 @@ handle_selection_request:
 .notify:
   lea rdi,[event]
   xor eax,eax
-  mov ecx,24
+  mov ecx,XEVENT_BYTES/8
   rep stosq
   mov dword [event],SelectionNotify
   mov rax,[dpy]
-  mov qword [event+24],rax
+  mov qword [event+XSelectionNotify.display],rax
   mov rax,[req_window]
-  mov qword [event+32],rax
+  mov qword [event+XSelectionNotify.requestor],rax
   mov rax,[req_selection]
-  mov qword [event+40],rax
+  mov qword [event+XSelectionNotify.selection],rax
   mov rax,[req_target]
-  mov qword [event+48],rax
+  mov qword [event+XSelectionNotify.target],rax
   mov rax,[req_property]
-  mov qword [event+56],rax
+  mov qword [event+XSelectionNotify.property],rax
   mov rax,[req_time]
-  mov qword [event+64],rax
+  mov qword [event+XSelectionNotify.time],rax
   mov rdi,[dpy]
   mov rsi,[req_window]
   xor edx,edx
@@ -4716,13 +4691,13 @@ handle_selection_request:
   ret
 
 handle_selection_notify:
-  cmp qword [event+56],0
+  cmp qword [event+XSelectionNotify.property],0
   je .done
   mov dword [paste_offset],0
   cmp byte [bracketed],0
   je .fetch
   lea rsi,[bracket_start]
-  mov edx,6
+  mov edx,bracket_start_len
   call pty_write
 .fetch:
   mov rdi,[dpy]
@@ -4777,7 +4752,7 @@ handle_selection_notify:
   cmp byte [bracketed],0
   je .done
   lea rsi,[bracket_end]
-  mov edx,6
+  mov edx,bracket_end_len
   call pty_write
 .done:
   ret
@@ -4819,27 +4794,41 @@ section '.data' writeable
   server_dummy_argv dq server_executable,0
   cube db 0,95,135,175,215,255
   align 4
-  rgb_next dd 256
+  rgb_next dd PALETTE_RGB_FIRST
   ansi16 dd 0x101216,0xcd3131,0x29a753,0xd8ad3a
          dd 0x3c75cc,0xac62c0,0x32a3a3,0xc4c6ca
          dd 0x595b64,0xff6b6b,0x63d88e,0xffd766
          dd 0x7ea8ff,0xe89aee,0x73d5e6,0xffffff
   seq_up db 27,'[A'
+  seq_up_len = $ - seq_up
   seq_down db 27,'[B'
+  seq_down_len = $ - seq_down
   seq_right db 27,'[C'
+  seq_right_len = $ - seq_right
   seq_left db 27,'[D'
+  seq_left_len = $ - seq_left
   seq_home db 27,'[H'
+  seq_home_len = $ - seq_home
   seq_end db 27,'[F'
+  seq_end_len = $ - seq_end
   seq_pageup db 27,'[5~'
+  seq_pageup_len = $ - seq_pageup
   seq_pagedown db 27,'[6~'
+  seq_pagedown_len = $ - seq_pagedown
   seq_insert db 27,'[2~'
+  seq_insert_len = $ - seq_insert
   seq_delete db 27,'[3~'
+  seq_delete_len = $ - seq_delete
   bracket_start db 27,'[200~'
+  bracket_start_len = $ - bracket_start
   bracket_end db 27,'[201~'
+  bracket_end_len = $ - bracket_end
   width_probe dd 'M'
   error_pty_queue db 'fasterm: cannot queue PTY input',10,0
   status_ok db 27,'[0n'
+  status_ok_len = $ - status_ok
   device_id db 27,'[?6c'
+  device_id_len = $ - device_id
   gfx_box_segments db 3,3,12,12,0,0,0,0,0,0,0,0,10,10,10,10
   db 9,9,9,9,6,6,6,6,5,5,5,5,14,14,14,14
   db 14,14,14,14,13,13,13,13,13,13,13,13,11,11,11,11
@@ -4864,15 +4853,15 @@ section '.bss' writeable align 4096
   server_cwd_len rd 1
   server_env_count rd 1
   server_credlen rd 1
-  server_creds rb 12
+  server_creds rb UCRED_BYTES
   server_pipe rd 2
   preload_ready_pipe rd 2
-  server_pollfd rb 8
+  server_pollfd rb POLLFD_BYTES
   server_events rb 64
   tmp_display rq 1
   server_argv rq PRELOAD_MAXARGS+2
-  server_env_argv rq 256
-  server_addr rb 110
+  server_env_argv rq PRELOAD_MAXENVS+1
+  server_addr rb SOCKET_ADDR_BYTES
   request_buffer rb PRELOAD_PACKET
   dpy rq 1
   win rq 1
@@ -4887,8 +4876,8 @@ section '.bss' writeable align 4096
   run_style rd 1
   gfx_x rd 1
   gfx_color rq 1
-  width_metrics rb 12             ; XGlyphInfo (ASCII advance)
-  glyph_clip rb 8                 ; XRectangle for Unicode ink
+  width_metrics rb XGLYPHINFO_BYTES             ; XGlyphInfo (ASCII advance)
+  glyph_clip rb XRECTANGLE_BYTES                 ; XRectangle for Unicode ink
   border_color rq 1
   fallback_fonts rq 16
   fallback_next rd 1
@@ -5024,19 +5013,19 @@ section '.bss' writeable align 4096
   cursor_glyph rd 1
   keybuf rb 128
   mouse_buffer rb 64
-  winsize rb 8
-  pollfds rb 16
-  event rb 192
-  render_color rb 8
-  color_ready rb 4096
-  rgb_values rd 4096
+  winsize rb WINSIZE_BYTES
+  pollfds rb 2*POLLFD_BYTES
+  event rb XEVENT_BYTES
+  render_color rb XRENDERCOLOR_BYTES
+  color_ready rb PALETTE_CAP
+  rgb_values rd PALETTE_CAP
   align 16
-  colormap_xft rb 4096*16
+  colormap_xft rb PALETTE_CAP*XFTCOLOR_BYTES
   dirty rb MAXROW
   glyphs rd MAXCOL
   osc_buffer rb 512
   reply_buf rb 64
-  iobuf rb 32768
+  iobuf rb PTY_READ_BYTES
   clip_buffer rb CLIPCAP
   align 4096
   alternate rb MAXROW*ROWB
