@@ -22,6 +22,7 @@ extrn XCreateSimpleWindow
 extrn XSelectInput
 extrn XMapWindow
 extrn XCreateGC
+extrn XSetGraphicsExposures
 extrn XSetForeground
 extrn XFillRectangle
 extrn XDrawLine
@@ -35,6 +36,10 @@ extrn XLookupString
 extrn XFlush
 extrn XSync
 extrn XftDrawPicture
+extrn XCreatePixmap
+extrn XFreePixmap
+extrn XCopyArea
+extrn XDefaultDepth
 extrn XRenderFillRectangles
 extrn XRRQueryExtension
 extrn XRRQueryVersion
@@ -316,16 +321,16 @@ main:
   xor ecx,ecx
   ccall XCreateGC
   mov [gc],rax
-
+  ; XCopyArea would otherwise enqueue a NoExpose event on every frame.
   mov rdi,[dpy]
-  mov rsi,[win]
-  mov rdx,[visual]
-  mov rcx,[cmap]
-  ccall XftDrawCreate
-  mov [draw],rax
-  mov rdi,rax
-  ccall XftDrawPicture
-  mov [draw_picture],rax
+  mov rsi,[gc]
+  xor edx,edx
+  ccall XSetGraphicsExposures
+
+  ; Paint into a server-side pixmap, not the visible window. The entire
+  ; completed frame is copied to the window once, so rapid fullscreen output
+  ; cannot expose the gap between background clearing and lower-row glyphs.
+  call recreate_draw_target
 
   ; WM_DELETE_WINDOW protocol
   mov rdi,[dpy]
@@ -562,6 +567,65 @@ frame_clock:
 
 ; The XRandR library ABI and helpers are pure FASM.
 include 'include/randr_impl.inc'
+
+; Recreate the Xft destination for the current window size. All drawing
+; (including XRender fills, Unicode clips and Xft text) targets the pixmap.
+; No C helper, CPU-side framebuffer or second X11 connection is needed.
+; On allocation failure, fall back to the original direct window renderer.
+recreate_draw_target:
+  ; A newly allocated pixmap has undefined contents, including its margins.
+  mov byte [backbuffer_needs_full_copy],1
+  cmp qword [draw],0
+  je .free_pixmap
+  mov rdi,[draw]
+  ccall XftDrawDestroy
+  mov qword [draw],0
+.free_pixmap:
+  mov rsi,[back_pixmap]
+  test rsi,rsi
+  jz .create
+  mov rdi,[dpy]
+  ccall XFreePixmap
+  mov qword [back_pixmap],0
+.create:
+  mov rdi,[dpy]
+  mov esi,[screen]
+  ccall XDefaultDepth
+  mov r8d,eax
+  mov rdi,[dpy]
+  mov rsi,[win]
+  mov edx,[width]
+  mov ecx,[height]
+  ccall XCreatePixmap
+  test rax,rax
+  jz .fallback
+  mov [back_pixmap],rax
+  mov rdi,[dpy]
+  mov rsi,rax
+  mov rdx,[visual]
+  mov rcx,[cmap]
+  ccall XftDrawCreate
+  test rax,rax
+  jnz .ready
+  mov rdi,[dpy]
+  mov rsi,[back_pixmap]
+  ccall XFreePixmap
+  mov qword [back_pixmap],0
+.fallback:
+  mov rdi,[dpy]
+  mov rsi,[win]
+  mov rdx,[visual]
+  mov rcx,[cmap]
+  ccall XftDrawCreate
+.ready:
+  mov [draw],rax
+  test rax,rax
+  jz .no_picture
+  mov rdi,rax
+  ccall XftDrawPicture
+.no_picture:
+  mov [draw_picture],rax
+  ret
 
 ; rdi = XftColor*, rsi = XRectangle*, edx = count.
 ; Modern Xorg: a single bulk RENDER fill; older X servers without RENDER:
@@ -3392,12 +3456,29 @@ render:
   ; rows into bands, and submit those bands as *one* XRender request rather
   ; than one XftDrawRect call per dirty row.
   mov dword [bg_rect_count],0
+  mov dword [copy_min_y],7fffffffh
+  mov dword [copy_max_y],0
   xor r12d,r12d
 .bg_collect:
   cmp r12d,[rows]
   jge .bg_submit
   cmp byte [dirty+r12],0
   je .bg_collect_next
+  ; Track the vertical damage range while scanning dirty rows. One copy
+  ; of this band is cheaper than copying the entire fullscreen window when
+  ; only a few rows change. Borders are covered because the copy is full width.
+  mov eax,r12d
+  imul eax,[cell_h]
+  add eax,PAD
+  cmp eax,[copy_min_y]
+  jae .copy_min_ok
+  mov [copy_min_y],eax
+.copy_min_ok:
+  add eax,[cell_h]
+  cmp eax,[copy_max_y]
+  jbe .copy_max_ok
+  mov [copy_max_y],eax
+.copy_max_ok:
   mov edx,[bg_rect_count]
   test edx,edx
   jz .bg_new
@@ -3933,6 +4014,40 @@ render:
   lea rsi,[border_rects]
   mov edx,[border_rect_count]
   call fill_rectangles
+  ; X11 processes each connection in order: background, glyphs, then one
+  ; server-side copy. No intermediate blank glyph rows reach the window.
+  ; Full copy only for new pixmaps / Expose, otherwise copy the damage band.
+  cmp qword [back_pixmap],0
+  je .flush_direct
+  mov r9d,[copy_min_y]
+  mov eax,[copy_max_y]
+  sub eax,r9d
+  cmp byte [backbuffer_needs_full_copy],0
+  je .copy_band
+  xor r9d,r9d
+  mov eax,[height]
+  mov byte [backbuffer_needs_full_copy],0
+.copy_band:
+  mov [copy_height],eax
+  mov [copy_y],r9d
+  mov rdi,[dpy]
+  mov rsi,[back_pixmap]
+  mov rdx,[win]
+  mov rcx,[gc]
+  xor r8d,r8d
+  mov [stack_save],rsp
+  and rsp,-16
+  sub rsp,32
+  mov eax,[width]
+  mov [rsp],rax
+  mov eax,[copy_height]
+  mov [rsp+8],rax
+  mov qword [rsp+16],0
+  mov eax,[copy_y]
+  mov [rsp+24],rax
+  call XCopyArea
+  mov rsp,[stack_save]
+.flush_direct:
   mov rdi,[dpy]
   ccall XFlush
   pop r15
@@ -4009,6 +4124,8 @@ drain_x_events:
   call handle_key
   jmp .loop
 .expose:
+  ; Exposed margins also need restoring, not only the cell damage band.
+  mov byte [backbuffer_needs_full_copy],1
   call invalidate_all
   jmp .loop
 .config:
@@ -4053,6 +4170,8 @@ handle_resize:
   mov [width],eax
   mov eax,dword [event+XConfigure.height]
   mov [height],eax
+  ; A pixmap must match the window: XCopyArea cannot read pixels outside it.
+  call recreate_draw_target
   mov eax,[width]
   cmp eax,PAD*2
   jle .width_tiny
@@ -5098,6 +5217,12 @@ section '.bss' writeable align 4096
   unicode_font_tmp rq 1
   draw rq 1
   draw_picture rq 1
+  back_pixmap rq 1
+  copy_min_y rd 1
+  copy_max_y rd 1
+  copy_y rd 1
+  copy_height rd 1
+  backbuffer_needs_full_copy rb 1
   gc rq 1
   clipboard rq 1
   utf8_atom rq 1

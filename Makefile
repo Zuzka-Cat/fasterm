@@ -113,6 +113,7 @@ check: $(PROGRAMS) check-services
 	python3 tests/regress_unicode_fallback.py ./fasterm
 	xvfb-run -a python3 tests/regress_escape_stress.py ./fasterm
 	xvfb-run -a python3 tests/regress_rendering.py ./fasterm
+	xvfb-run -a python3 tests/regress_fullscreen_buffer.py ./fasterm
 	xvfb-run -a python3 tests/regress_cell_geometry.py ./fasterm
 	xvfb-run -a python3 tests/regress_insert_mode.py ./fasterm
 	xvfb-run -a python3 tests/regress_paste_resize.py ./fasterm
